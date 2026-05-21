@@ -39,5 +39,6 @@ async fn main() -> Result<()> {
         Command::Init(args) => commands::init::run(&config, args),
         Command::Status(args) => commands::status::run(&config, args).await,
         Command::Search(args) => commands::search::run(&config, args).await,
+        Command::WritePage(args) => commands::write_page::run(&config, args).await,
     }
 }

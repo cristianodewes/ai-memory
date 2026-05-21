@@ -97,12 +97,14 @@ mod tests {
     async fn open_and_upsert_page() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
-        let ws = WorkspaceId::new();
-        let proj = ProjectId::new();
-        store.writer.ensure_workspace(ws, "default").await.unwrap();
-        store
+        let ws = store
             .writer
-            .ensure_project(proj, ws, "ai-memory", None)
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
             .await
             .unwrap();
         let id_a = store
@@ -127,15 +129,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_or_create_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let a = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let b = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        assert_eq!(a, b);
+        let pa = store
+            .writer
+            .get_or_create_project(a, "scratch", None)
+            .await
+            .unwrap();
+        let pb = store
+            .writer
+            .get_or_create_project(a, "scratch", None)
+            .await
+            .unwrap();
+        assert_eq!(pa, pb);
+    }
+
+    #[tokio::test]
     async fn serialises_parallel_writes() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
-        let ws = WorkspaceId::new();
-        let proj = ProjectId::new();
-        store.writer.ensure_workspace(ws, "default").await.unwrap();
-        store
+        let ws = store
             .writer
-            .ensure_project(proj, ws, "ai-memory", None)
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
             .await
             .unwrap();
         // Spawn 16 concurrent writes; the writer must serialise them.
@@ -172,12 +204,14 @@ mod tests {
     async fn search_finds_inserted_page_and_counts_reflect_supersession() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
-        let ws = WorkspaceId::new();
-        let proj = ProjectId::new();
-        store.writer.ensure_workspace(ws, "default").await.unwrap();
-        store
+        let ws = store
             .writer
-            .ensure_project(proj, ws, "ai-memory", None)
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
             .await
             .unwrap();
 

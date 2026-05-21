@@ -19,17 +19,15 @@ use crate::ops;
 
 /// Commands accepted by the writer thread.
 pub(crate) enum WriteCmd {
-    EnsureWorkspace {
-        id: WorkspaceId,
+    GetOrCreateWorkspace {
         name: String,
-        reply: oneshot::Sender<StoreResult<()>>,
+        reply: oneshot::Sender<StoreResult<WorkspaceId>>,
     },
-    EnsureProject {
-        id: ProjectId,
+    GetOrCreateProject {
         workspace_id: WorkspaceId,
         name: String,
         repo_path: Option<String>,
-        reply: oneshot::Sender<StoreResult<()>>,
+        reply: oneshot::Sender<StoreResult<ProjectId>>,
     },
     UpsertPage {
         page: NewPage,
@@ -66,19 +64,17 @@ impl WriterHandle {
         }
     }
 
-    /// Ensure a workspace row exists.
+    /// Resolve a workspace by name, creating it atomically if missing.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
-    /// propagates the SQL error from [`ops::ensure_workspace`].
-    pub async fn ensure_workspace(
+    /// propagates the SQL error from [`ops::get_or_create_workspace`].
+    pub async fn get_or_create_workspace(
         &self,
-        id: WorkspaceId,
         name: impl Into<String>,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<WorkspaceId> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::EnsureWorkspace {
-            id,
+        self.send(WriteCmd::GetOrCreateWorkspace {
             name: name.into(),
             reply: tx,
         })
@@ -86,21 +82,20 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Ensure a project row exists under the given workspace.
+    /// Resolve a project by `(workspace_id, name)`, creating it atomically
+    /// if missing.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
-    /// propagates the SQL error from [`ops::ensure_project`].
-    pub async fn ensure_project(
+    /// propagates the SQL error from [`ops::get_or_create_project`].
+    pub async fn get_or_create_project(
         &self,
-        id: ProjectId,
         workspace_id: WorkspaceId,
         name: impl Into<String>,
         repo_path: Option<String>,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<ProjectId> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::EnsureProject {
-            id,
+        self.send(WriteCmd::GetOrCreateProject {
             workspace_id,
             name: name.into(),
             repo_path,
@@ -144,19 +139,22 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
             WriteCmd::Shutdown => break,
-            WriteCmd::EnsureWorkspace { id, name, reply } => {
-                let result = ops::ensure_workspace(&mut conn, &id, &name);
+            WriteCmd::GetOrCreateWorkspace { name, reply } => {
+                let result = ops::get_or_create_workspace(&mut conn, &name);
                 let _ = reply.send(result);
             }
-            WriteCmd::EnsureProject {
-                id,
+            WriteCmd::GetOrCreateProject {
                 workspace_id,
                 name,
                 repo_path,
                 reply,
             } => {
-                let result =
-                    ops::ensure_project(&mut conn, &id, &workspace_id, &name, repo_path.as_deref());
+                let result = ops::get_or_create_project(
+                    &mut conn,
+                    &workspace_id,
+                    &name,
+                    repo_path.as_deref(),
+                );
                 let _ = reply.send(result);
             }
             WriteCmd::UpsertPage { page, reply } => {

@@ -33,6 +33,8 @@ pub enum Command {
     Status(StatusArgs),
     /// Full-text search the wiki via FTS5.
     Search(SearchArgs),
+    /// Write or update a wiki page atomically (also indexes it in the store).
+    WritePage(WritePageArgs),
 }
 
 /// Arguments for `init`.
@@ -62,4 +64,34 @@ pub struct SearchArgs {
     /// Emit results as JSON.
     #[arg(long)]
     pub json: bool,
+}
+
+/// Arguments for `write-page`.
+#[derive(Debug, Args)]
+pub struct WritePageArgs {
+    /// Relative wiki path (e.g. `notes/foo.md`).
+    #[arg(long, visible_alias = "p")]
+    pub path: String,
+    /// Markdown body. Use `-` to read from stdin.
+    #[arg(long, visible_alias = "b")]
+    pub body: String,
+    /// Optional page title; otherwise derived from the first `# heading`
+    /// in the body, or the path stem.
+    #[arg(long)]
+    pub title: Option<String>,
+    /// Repeatable tag to add to the frontmatter `tags` array.
+    #[arg(long, short = 't')]
+    pub tag: Vec<String>,
+    /// Tier (`working`, `episodic`, `semantic`, `procedural`).
+    #[arg(long, default_value = "semantic")]
+    pub tier: String,
+    /// Pin the page so the future decay sweep skips it.
+    #[arg(long)]
+    pub pinned: bool,
+    /// Workspace name (auto-created if absent).
+    #[arg(long, default_value = "default")]
+    pub workspace: String,
+    /// Project name within the workspace (auto-created if absent).
+    #[arg(long, default_value = "scratch")]
+    pub project: String,
 }

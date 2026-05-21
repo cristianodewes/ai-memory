@@ -10,6 +10,18 @@ description = "Markdown wiki read/write, file watcher and git versioning."
 
 [dependencies]
 ai-memory-core.workspace = true
+ai-memory-store.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tempfile.workspace = true
+jiff.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
 
 [lints]
 workspace = true

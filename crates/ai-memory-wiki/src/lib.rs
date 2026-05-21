@@ -1,4 +1,15 @@
 //! Wiki filesystem layer.
 //!
-//! Owns the markdown-on-disk source of truth: atomic writes, watcher with
-//! reconciliation pass, git versioning. Implementation lands in milestone M1.
+//! Owns the markdown-on-disk source of truth: atomic writes, frontmatter
+//! parsing/emission, and write-through to the [`ai_memory_store`] writer
+//! actor so the SQLite index never diverges from the file. The watcher +
+//! git layer arrive in M1-D and M5.
+
+mod atomic;
+mod error;
+mod markdown;
+mod wiki;
+
+pub use error::{WikiError, WikiResult};
+pub use markdown::{Markdown, derive_title, emit, parse};
+pub use wiki::{Wiki, WritePageRequest};

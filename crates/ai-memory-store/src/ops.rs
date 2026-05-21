@@ -120,41 +120,68 @@ pub fn upsert_page(conn: &mut Connection, page: &NewPage) -> StoreResult<PageId>
     Ok(result_id)
 }
 
-/// Ensure a workspace exists; insert a stub row keyed on `name` otherwise.
-pub fn ensure_workspace(
+/// Resolve a workspace by name, creating it if missing. Atomic.
+pub fn get_or_create_workspace(
     conn: &mut Connection,
-    id: &ai_memory_core::WorkspaceId,
     name: &str,
-) -> StoreResult<()> {
-    conn.execute(
-        "INSERT INTO workspaces (id, name, created_at) VALUES (?1, ?2, ?3) \
-         ON CONFLICT(name) DO NOTHING",
-        params![id.as_bytes(), name, Timestamp::now().as_microsecond()],
-    )?;
-    Ok(())
+) -> StoreResult<ai_memory_core::WorkspaceId> {
+    let tx = conn.transaction()?;
+    let existing: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT id FROM workspaces WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let id = if let Some(bytes) = existing {
+        ai_memory_core::WorkspaceId::from_slice(&bytes)?
+    } else {
+        let id = ai_memory_core::WorkspaceId::new();
+        tx.execute(
+            "INSERT INTO workspaces (id, name, created_at) VALUES (?1, ?2, ?3)",
+            params![id.as_bytes(), name, Timestamp::now().as_microsecond()],
+        )?;
+        id
+    };
+    tx.commit()?;
+    Ok(id)
 }
 
-/// Ensure a project exists under the given workspace.
-pub fn ensure_project(
+/// Resolve a project by `(workspace_id, name)`, creating it if missing.
+/// Atomic.
+pub fn get_or_create_project(
     conn: &mut Connection,
-    id: &ai_memory_core::ProjectId,
     workspace_id: &ai_memory_core::WorkspaceId,
     name: &str,
     repo_path: Option<&str>,
-) -> StoreResult<()> {
-    conn.execute(
-        "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5) \
-         ON CONFLICT(workspace_id, name) DO NOTHING",
-        params![
-            id.as_bytes(),
-            workspace_id.as_bytes(),
-            name,
-            repo_path,
-            Timestamp::now().as_microsecond()
-        ],
-    )?;
-    Ok(())
+) -> StoreResult<ai_memory_core::ProjectId> {
+    let tx = conn.transaction()?;
+    let existing: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT id FROM projects WHERE workspace_id = ?1 AND name = ?2",
+            params![workspace_id.as_bytes(), name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let id = if let Some(bytes) = existing {
+        ai_memory_core::ProjectId::from_slice(&bytes)?
+    } else {
+        let id = ai_memory_core::ProjectId::new();
+        tx.execute(
+            "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id.as_bytes(),
+                workspace_id.as_bytes(),
+                name,
+                repo_path,
+                Timestamp::now().as_microsecond()
+            ],
+        )?;
+        id
+    };
+    tx.commit()?;
+    Ok(id)
 }
 
 fn audit(
