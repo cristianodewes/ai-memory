@@ -109,6 +109,36 @@ When Claude Code or Codex compact their working context, the
 compaction, the agent can recover the summary via `memory_recent`
 even though its raw history is gone.
 
+### Adopting ai-memory mid-project: bootstrap
+
+If you're installing ai-memory in a project you've been working on
+for months, the wiki starts empty and the first few sessions are
+net-zero — you're populating, not retrieving. `ai-memory bootstrap`
+solves that by LLM-summarising your existing `git log`, README,
+`docs/`, and module-level doc-comments into seed wiki pages.
+
+```bash
+# Run from your project's repo root (requires an LLM provider on the
+# server). Default settings ingest everything; budget caps at 50k
+# input tokens (~$0.04 with Kimi 2.6).
+docker run --rm \
+    -v ai-memory-data:/data \
+    -v "$PWD:/repo" \
+    -e AI_MEMORY_AUTH_TOKEN="$TOKEN" \
+    -e AI_MEMORY_LLM_PROVIDER=anthropic \
+    -e ANTHROPIC_API_KEY=sk-ant-... \
+    akitaonrails/ai-memory:latest \
+    bootstrap --repo-path /repo --workspace homelab --project myproj
+```
+
+Bootstrap produces a `wiki/bootstrap.md` manifest listing every page
+generated + a one-paragraph rationale. Run with `--dry-run` first to
+preview which sources would be sent without paying for the LLM call.
+Re-running on the same project requires `--force`.
+
+See [`docs/install.md`](docs/install.md#bootstrap-mid-project) for
+the full flag reference + per-source priority order.
+
 ### Spelunking your own history
 
 ```bash

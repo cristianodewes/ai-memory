@@ -280,6 +280,83 @@ volume). Outside docker, override with `AI_MEMORY_DATA_DIR=/path`.
 
 ---
 
+## Bootstrap mid-project {#bootstrap-mid-project}
+
+When you adopt ai-memory in a project that's already been around for
+a while, the wiki starts empty. `ai-memory bootstrap` ingests the
+project's existing history into seed pages so the first session has
+warm context.
+
+```bash
+docker run --rm \
+    -v ai-memory-data:/data \
+    -v "$PWD:/repo" \
+    -e AI_MEMORY_AUTH_TOKEN="$TOKEN" \
+    -e AI_MEMORY_LLM_PROVIDER=anthropic \
+    -e ANTHROPIC_API_KEY=sk-ant-... \
+    akitaonrails/ai-memory:latest \
+    bootstrap --repo-path /repo
+```
+
+**What gets ingested by default:**
+
+| Source | Priority (dropped first when over budget) |
+|---|---|
+| `CLAUDE.md` / `AGENTS.md` (project rules) | never dropped |
+| `README.md` at the repo root | very-late |
+| `docs/**/*.md` | late |
+| Substantive git commits (body >120 chars OR conventional-commit prefix) | mid |
+| Module-level `//!` doc-comments in `**/*.rs` | first to drop |
+
+**Flags:**
+
+```
+--repo-path <PATH>         (default: git rev-parse --show-toplevel)
+--workspace <NAME>         (default: "default")
+--project <NAME>           (default: "scratch")
+--max-input-tokens N       (default: 50000)
+--since "30 days ago"      (git log filter; supports "N days/months/years ago" + YYYY-MM-DD)
+--exclude-git              (skip commit history)
+--exclude-readme           (skip README)
+--exclude-docs             (skip docs/**/*.md)
+--exclude-code             (skip Rust module headers)
+--dry-run                  (collect + estimate but don't call LLM or write)
+--force                    (re-bootstrap, overwrites the prior manifest)
+```
+
+**Cost.** With Kimi 2.6 via OpenRouter ($0.73/$3.49 per M):
+- 50k input tokens cap → ~$0.04 worst case input
+- 1-2k generated tokens → ~$0.007 output
+- Total: well under $0.20 per run.
+
+**Idempotency.** The first run produces `wiki/bootstrap.md`
+listing every page generated + a one-paragraph rationale. Re-running
+without `--force` errors out. Delete the manifest (and the generated
+pages) if you want a clean re-bootstrap.
+
+**Dry-run first.** Always worth doing before the real call to see
+which sources would actually be sent + how many tokens that
+represents. Output is JSON to stdout.
+
+```bash
+docker run --rm -v "$PWD:/repo" ... bootstrap --repo-path /repo --dry-run
+{
+  "sources_collected": 117,
+  "sources_sent": 22,
+  "sources_dropped": 95,
+  "estimated_input_tokens": 48760,
+  "pages_written": [],
+  "rationale": "(dry-run; LLM not invoked)",
+  "dry_run": true
+}
+```
+
+**Caveat: LLM-fabricated detail.** A bootstrap run can produce
+plausible-but-wrong pages (the LLM doesn't know your project, it's
+inferring from git history). The wiki is git-versioned precisely so
+this is recoverable: review what landed, `docker exec ai-memory git
+-C /data/wiki diff HEAD~1`, and revert if it's off.
+
 ## Operating without auth
 
 For local-only / single-machine deploys you can skip the bearer

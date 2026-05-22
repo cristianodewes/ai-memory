@@ -72,6 +72,7 @@ dependencies = [
  "ai-memory-store",
  "ai-memory-wiki",
  "anyhow",
+ "git2",
  "jiff",
  "rusqlite",
  "schemars",

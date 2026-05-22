@@ -13,6 +13,7 @@ ai-memory-core.workspace = true
 ai-memory-store.workspace = true
 ai-memory-wiki.workspace = true
 ai-memory-llm.workspace = true
+git2.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true

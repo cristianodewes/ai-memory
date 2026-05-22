@@ -68,6 +68,66 @@ pub enum Command {
     /// config snippet. Replaces the "clone the repo + cargo build"
     /// workflow for users who never want a local Rust toolchain.
     SetupAgent(SetupAgentArgs),
+    /// Pre-load an existing project's history into the wiki by
+    /// LLM-summarising git log, README, docs/, and module headers
+    /// into seed wiki pages. Run once when adopting ai-memory in a
+    /// project that's been around for a while. Requires
+    /// AI_MEMORY_LLM_PROVIDER configured on the server.
+    Bootstrap(BootstrapArgs),
+}
+
+/// Arguments for `bootstrap`.
+#[derive(Debug, Args)]
+pub struct BootstrapArgs {
+    /// Path of the project repo whose history we should ingest.
+    /// Defaults to `git rev-parse --show-toplevel` resolved from the
+    /// current directory (so running bootstrap from any subdir of the
+    /// project works).
+    #[arg(long)]
+    pub repo_path: Option<PathBuf>,
+    /// Workspace + project labels stamped on the generated pages.
+    /// Match what your `ai-memory serve` uses so the bootstrap pages
+    /// live in the same wiki silo as future captured sessions.
+    #[arg(long, default_value = "default")]
+    pub workspace: String,
+    #[arg(long, default_value = "scratch")]
+    pub project: String,
+    /// Maximum total tokens of source text sent to the LLM in one
+    /// run. When the collected sources exceed this, lower-priority
+    /// inputs (older git commits, then code module headers, then
+    /// docs) are dropped first. At Kimi's ~$3.49/M completion price
+    /// a 50000-token cap caps the worst-case run at ~$0.20.
+    #[arg(long, default_value_t = 50_000)]
+    pub max_input_tokens: usize,
+    /// Skip git-commit history ingestion.
+    #[arg(long)]
+    pub exclude_git: bool,
+    /// Skip README ingestion.
+    #[arg(long)]
+    pub exclude_readme: bool,
+    /// Skip docs/**/*.md ingestion.
+    #[arg(long)]
+    pub exclude_docs: bool,
+    /// Skip code module headers (Rust `//!` doc-comments at the top
+    /// of `**/*.rs` files).
+    #[arg(long)]
+    pub exclude_code: bool,
+    /// git-log time filter (passed through to `git log --since`).
+    /// Useful when a repo is years old and you only want recent
+    /// history (e.g. `--since "180 days ago"`). Default: no limit.
+    #[arg(long)]
+    pub since: Option<String>,
+    /// LLM-call dry run: collects sources, builds the prompt, and
+    /// prints what *would* be sent — but never calls the provider
+    /// and never writes to the wiki. Useful for verifying the source
+    /// selection before paying for a real run.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Re-bootstrap a project that already has a bootstrap manifest
+    /// page. Without this flag, `bootstrap` refuses to run twice on
+    /// the same project (the manifest is `wiki/bootstrap.md`).
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Arguments for `setup-agent`.

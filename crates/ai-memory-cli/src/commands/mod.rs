@@ -1,6 +1,7 @@
 //! Subcommand implementations.
 
 pub mod backup;
+pub mod bootstrap;
 pub mod commit;
 pub mod embed;
 pub mod forget_sweep;

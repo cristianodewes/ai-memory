@@ -56,5 +56,6 @@ async fn main() -> Result<()> {
         Command::Embed(args) => commands::embed::run(&config, args).await,
         Command::GenerateAuthToken(args) => commands::generate_auth_token::run(&config, args),
         Command::SetupAgent(args) => commands::setup_agent::run(&config, args),
+        Command::Bootstrap(args) => commands::bootstrap::run(&config, args).await,
     }
 }
