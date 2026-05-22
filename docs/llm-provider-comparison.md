@@ -20,13 +20,18 @@
 > typo-fix session (mild over-classification), where Haiku
 > correctly emitted only the session log.
 >
-> **Production choice**: Ollama `qwen3:32b` for default
-> consolidation ($0, latency irrelevant since consolidation is
-> background). **Best hosted fallback if budget is tight**:
-> GPT-5.4-mini (cheapest + fastest). **Best hosted fallback if
-> restraint matters most**: Haiku 4.5 (more disciplined on
-> "say nothing when there's nothing to say"). Reproduce the
-> comparison in [`evals/`](../evals/).
+> **Recommended default for most users: Claude Haiku 4.5.**
+> Hosted (always available), fast (~7 s), cheap enough that
+> per-session cost doesn't matter for personal use, and the
+> most disciplined hosted model on restraint + classification.
+> **Cheaper alternative**: GPT-5.4-mini (~5× cheaper than
+> Haiku, ~2× faster, mild over-classification on trivial
+> sessions). **Free alternative if you have a local LLM
+> server** (Ollama / vLLM / llama-swap with a 30B-class
+> model): qwen3:32b on Ollama — $0 per consolidation,
+> background latency invisible to users. See
+> [README → LLM provider configuration](../README.md#llm-provider--recommended-defaults)
+> for setup. Reproduce the comparison in [`evals/`](../evals/).
 
 ## Why this document exists
 
@@ -475,15 +480,16 @@ exuberant than Haiku.
 Ranking on a 0–5 scale per axis, then aggregated.
 **Higher is better** in every column except Cost (where
 lower-cost gets a higher score). Bold = best in that column.
+Rows sorted by overall fitness for ai-memory.
 
-| Provider | Parse | Speed | Cost† | Faithfulness | Restraint | Classification | Fitness for ai-memory |
-|---|---|---|---|---|---|---|---|
-| **qwen3:32b (Ollama)** | 5 | 1 | **5** ($0) | 5 | **5** | 4 | **5** — production default |
-| **Haiku 4.5** | 5 | 4 | 3 | 5 | **5** | **5** | 5 — best hosted fallback |
-| GPT-5.4-mini | 5 | **5** | **5** | 5 | 3 | 4 | 4 — cheap+fast but mild over-extraction |
-| Sonnet 4.5 | 5 | 4 | 1 | 4‡ | 4 | 3 | 3 — displaced by Haiku |
-| DeepSeek V4 Flash | 5 | 2 | 4 | 5 | **5** | **5** | 4 — solid but no edge over Haiku |
-| Kimi-K2.6 | 0 | 0 | n/a | n/a | n/a | n/a | **0** — ineligible (reasoning model) |
+| # | Provider | Parse | Speed | Cost† | Faithfulness | Restraint | Classification | Fitness |
+|---|---|---|---|---|---|---|---|---|
+| 1 | **Haiku 4.5** | 5 | 4 | 3 | 5 | **5** | **5** | **5** — recommended default |
+| 2 | **GPT-5.4-mini** | 5 | **5** | **5** | 5 | 3 | 4 | 4 — cheaper alternative |
+| 3 | **qwen3:32b (Ollama)** | 5 | 1 | **5** ($0) | 5 | **5** | 4 | 4 — free if you have a local server |
+| 4 | DeepSeek V4 Flash | 5 | 2 | 4 | 5 | **5** | **5** | 4 — no edge over GPT-mini or Haiku |
+| 5 | Sonnet 4.5 | 5 | 4 | 1 | 4‡ | 4 | 3 | 3 — displaced by Haiku |
+| 6 | Kimi-K2.6 | 0 | 0 | n/a | n/a | n/a | n/a | **0** — ineligible (reasoning model) |
 
 † Cost score derived from order-of-magnitude $/M output tokens:
 $0 (qwen3) = 5; ~$0.40 (DeepSeek) = 4; ~$1 (GPT-mini) = 5 by
@@ -525,24 +531,44 @@ better defaults for this task.
 
 For ai-memory's consolidation task specifically:
 
-1. **qwen3:32b on Ollama** — fits free, restrained, faithful,
-   homelab handles latency invisibly. Tied for top on every
-   non-speed axis; speed doesn't matter for background work.
-2. **Haiku 4.5** — best hosted choice when local is unreachable.
-   Restraint + classification edge over GPT-mini and DeepSeek.
-3. **GPT-5.4-mini** — pick if you're hosted-only and budget-
-   sensitive. Fastest + cheapest, only weak point is
-   over-classification of trivial sessions.
-4. **DeepSeek V4 Flash** — solid but no edge over GPT-mini or
-   Haiku on either cost+speed or quality. Pick if your stack
-   is already DeepSeek-ish.
-5. **Sonnet 4.5** — only if you specifically need the extra
-   reasoning headroom (lint sweep, cross-page contradiction
-   detection); for plain consolidation it's strictly dominated
-   by Haiku.
-6. **Kimi-K2.6** — ineligible. Reasoning model burns
-   `max_tokens` on internal thinking before emitting visible
-   content.
+1. **Haiku 4.5** — **recommended default for most users.**
+   Hosted (always available), 7 s avg latency, restraint +
+   classification top of the field, ~$0.02/run is negligible
+   for personal use. The benchmark every other option is
+   measured against.
+2. **GPT-5.4-mini** — **cheaper hosted alternative.** ~5×
+   cheaper than Haiku, 2× faster (4 s avg). Only weakness is
+   mild over-classification on trivial sessions
+   (manufactures one extra "decisions/" page on a typo-fix
+   session). If budget matters more than restraint, pick
+   this.
+3. **qwen3:32b on Ollama** — **free alternative for those
+   with a local server.** $0 per consolidation. ~92 s
+   latency is invisible because consolidation is a background
+   job. Restraint + faithfulness match the top hosted models.
+   Requires Ollama (or compatible OpenAI-compat server) with
+   `qwen3:32b` pulled and enough RAM/VRAM (~20 GB) to keep
+   it warm.
+4. **DeepSeek V4 Flash** — **solid but no clear edge.** All
+   reliability bars met, faithful, restrained, correctly
+   classifies rules. But GPT-mini matches it on quality and
+   beats it on speed; Haiku matches it on quality and beats
+   it on classification consistency. Pick only if your
+   workflow is already DeepSeek-leaning.
+5. **Sonnet 4.5** — **strictly dominated by Haiku** for
+   plain consolidation. 3× the cost for the same parse rate
+   and only marginally different latency. Reserve for tasks
+   that *specifically* need extended reasoning (cross-page
+   lint sweeps that compare contradictory claims across many
+   pages, or for sparse-observation sessions where you want
+   the model to infer more aggressively).
+6. **Kimi-K2.6** — **ineligible.** Reasoning model burns
+   `max_tokens` budget on internal thinking before emitting
+   visible content. Hangs indefinitely on strict-JSON
+   prompts. Same caveat applies to any other reasoning-mode
+   model (Claude with extended thinking, GPT-o3, Gemini
+   "thinking" variants) — turn reasoning off or budget
+   tokens with consumption in mind before using them here.
 
 ## Qualitative read (Run 2)
 

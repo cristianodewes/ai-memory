@@ -206,24 +206,147 @@ preview without writing.
 ## LLM provider — recommended defaults
 
 You can run ai-memory entirely without an LLM (FTS5 search +
-rule-based summaries, $0). When you do configure one, sensible
-defaults kick in for the model:
+rule-based summaries, $0). When you *do* configure one, the
+options below are ranked by fitness for ai-memory's
+consolidation workload — see
+[`docs/llm-provider-comparison.md`](docs/llm-provider-comparison.md)
+for the empirical writeup behind this ranking.
 
-| Provider env | Default model | Notes |
-|---|---|---|
-| `AI_MEMORY_LLM_PROVIDER=anthropic` | `claude-sonnet-4-6` | Smart enough to summarise a session, cheap enough to run on every session-end. |
-| `AI_MEMORY_LLM_PROVIDER=openai` | `gpt-4o-mini` | OpenAI equivalent of the Sonnet tier in price/quality. |
-| `AI_MEMORY_LLM_PROVIDER=openai-compat` | (required) | Set `AI_MEMORY_LLM_BASE_URL` + `AI_MEMORY_LLM_MODEL`. Use for Ollama, OpenRouter, vLLM, LM Studio. |
+> **TL;DR.** Use **Claude Haiku 4.5** as your default. Switch
+> to **GPT-5.4-mini** if you want the same quality cheaper +
+> faster. Switch to **qwen3:32b on Ollama** if you have a
+> local LLM server and prefer $0 / fully-self-hosted. The
+> three are interchangeable; pick once and forget.
 
-Embedding defaults (when `AI_MEMORY_EMBEDDING_PROVIDER` is set):
+### Option 1 — Claude Haiku 4.5 *(recommended default)*
+
+Best balance of speed (~7 s), restraint, and classification
+quality. The only model that consistently classifies durable
+project rules as `kind: rule` so the consolidator auto-routes
+them to `_rules/<slug>.md`. ~$0.02 per consolidation; cost
+is negligible for personal use.
+
+```bash
+AI_MEMORY_LLM_PROVIDER=anthropic
+AI_MEMORY_LLM_MODEL=claude-haiku-4-5
+ANTHROPIC_API_KEY=sk-ant-…
+```
+
+Or via OpenRouter (handy if you already have an OpenRouter
+account and want one bill):
+
+```bash
+AI_MEMORY_LLM_PROVIDER=openai-compat
+AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1
+AI_MEMORY_LLM_MODEL=anthropic/claude-haiku-4.5
+LLM_API_KEY=sk-or-v1-…
+```
+
+### Option 2 — OpenAI GPT-5.4-mini *(cheaper alternative)*
+
+~5× cheaper than Haiku, ~2× faster (~4 s avg). Same parse
+reliability, same faithfulness. One known weakness: mild
+over-classification on trivial sessions (will sometimes
+manufacture an extra `decisions/` page for a thin
+session). Acceptable for most users.
+
+```bash
+AI_MEMORY_LLM_PROVIDER=openai
+AI_MEMORY_LLM_MODEL=gpt-5.4-mini
+OPENAI_API_KEY=sk-…
+```
+
+Or via OpenRouter:
+
+```bash
+AI_MEMORY_LLM_PROVIDER=openai-compat
+AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1
+AI_MEMORY_LLM_MODEL=openai/gpt-5.4-mini
+LLM_API_KEY=sk-or-v1-…
+```
+
+### Option 3 — Local Ollama qwen3:32b *(free / self-hosted)*
+
+$0 per consolidation. Requires a machine with at least ~24 GB
+of unified or VRAM memory to keep the Q4_K_M weights warm
+(~20 GB) plus headroom. Strix Halo / Apple Silicon / a
+recent NVIDIA card all work. Latency is ~90 s but
+consolidation is a background job — users never see it.
+
+One-time setup on the Ollama host:
+
+```bash
+ollama pull qwen3:32b
+ollama pull nomic-embed-text   # for embeddings; see below
+# Recommended Ollama env:
+#   OLLAMA_KEEP_ALIVE=20m       (keep models warm between consolidations)
+#   OLLAMA_FLASH_ATTENTION=1
+#   OLLAMA_KV_CACHE_TYPE=q8_0   (halves KV memory)
+```
+
+ai-memory env:
+
+```bash
+AI_MEMORY_LLM_PROVIDER=openai-compat
+AI_MEMORY_LLM_BASE_URL=http://<ollama-host>:11434/v1
+AI_MEMORY_LLM_MODEL=qwen3:32b
+LLM_API_KEY=ollama-local                  # any non-empty value; Ollama doesn't validate
+```
+
+If you bind ai-memory to a non-loopback address so Claude
+Code on a different machine can reach it, also set:
+
+```bash
+AI_MEMORY_ALLOWED_HOSTS=<your-host-or-ip>,localhost,127.0.0.1
+```
+
+(Without this rmcp's DNS-rebinding guard rejects external
+`Host` headers with 403. See
+[`docs/llm-provider-comparison.md`](docs/llm-provider-comparison.md)
+for the discovery story.)
+
+### What we don't recommend
+
+- **Claude Sonnet 4.5** — strictly dominated by Haiku for
+  this task: same parse reliability, 3× cost, hallucinated
+  details before the prompt was tightened. Use it only if
+  you specifically need extended reasoning (e.g. cross-page
+  lint sweeps).
+- **Reasoning-mode models** (Kimi-K2.6, Claude with extended
+  thinking enabled, GPT-o3, Gemini "thinking" variants) —
+  these models burn `max_tokens` budget on internal
+  reasoning before emitting visible content; with the
+  strict-JSON consolidation prompt they hang or emit empty
+  responses. If you must use one, turn reasoning off.
+
+### Embedding provider
+
+The LLM provider drives consolidation + lint. Embeddings are
+a *separate* concern (hybrid retrieval over the wiki — BM25
++ vector RRF). Defaults when `AI_MEMORY_EMBEDDING_PROVIDER`
+is set:
 
 | Provider | Default model | Dim |
 |---|---|---|
 | `openai` | `text-embedding-3-small` | 1536 |
 | `voyage` | `voyage-3` | 1024 |
 
-Per-tier feature breakdown + the openai-compat / Ollama setup is in
-[`docs/install.md`](docs/install.md#llm-provider-tiers).
+For the local stack, point the OpenAI embedder at Ollama:
+
+```bash
+AI_MEMORY_EMBEDDING_PROVIDER=openai
+AI_MEMORY_EMBEDDING_BASE_URL=http://<ollama-host>:11434/v1
+AI_MEMORY_EMBEDDING_MODEL=nomic-embed-text
+AI_MEMORY_EMBEDDING_DIM=768
+OPENAI_API_KEY=ollama-local
+```
+
+Skipping the embedding provider entirely is fine —
+`memory_query` falls back to pure FTS5 (BM25) and still
+works; you just lose vector re-ranking.
+
+Per-tier feature breakdown + the openai-compat / Ollama setup
+is in [`docs/install.md`](docs/install.md#llm-provider-tiers).
 
 ## Architecture in 60 seconds
 
