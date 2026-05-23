@@ -82,11 +82,27 @@ pub(crate) fn build_claude_code_payload(
         if let Some(t) = auth_token {
             env.insert("AI_MEMORY_AUTH_TOKEN".into(), json!(t));
         }
+        // Claude Code's hook schema:
+        //   "<EventName>": [
+        //     { "matcher": "<tool-name regex or empty>",
+        //       "hooks": [ { "type": "command", "command": "...", "env": {...} } ]
+        //     }
+        //   ]
+        // The OUTER array carries `matcher` + a nested `hooks` array.
+        // The INNER hook entry carries `type: "command"` plus the
+        // actual command. An empty matcher means "fire for every
+        // event of this kind" — appropriate for ai-memory's
+        // capture hooks which want every tool call, every prompt,
+        // every session boundary.
         hooks_block.insert(
             event.into(),
             json!([{
-                "command": abs.to_string_lossy().into_owned(),
-                "env": env,
+                "matcher": "",
+                "hooks": [{
+                    "type": "command",
+                    "command": abs.to_string_lossy().into_owned(),
+                    "env": env,
+                }],
             }]),
         );
     }
@@ -124,21 +140,58 @@ mod tests {
     fn claude_code_payload_embeds_auth_token_when_provided() {
         let root = PathBuf::from("/host/hooks/claude-code");
         let v = build_claude_code_payload(&root, "http://localhost:49374", Some("tok"));
+        // Updated for Claude Code's matcher+hooks shape: env lives
+        // on the INNER hook entry now (one nesting level deeper).
         let session_start = v
-            .pointer("/hooks/SessionStart/0/env/AI_MEMORY_AUTH_TOKEN")
+            .pointer("/hooks/SessionStart/0/hooks/0/env/AI_MEMORY_AUTH_TOKEN")
             .and_then(|s| s.as_str())
             .unwrap();
         assert_eq!(session_start, "tok");
+    }
+
+    /// Regression guard: Claude Code's hook schema requires the
+    /// outer array entries to have `matcher` + a nested `hooks`
+    /// array (containing the actual `type: "command"` payload).
+    /// We shipped the wrong shape briefly — bare `command` at the
+    /// outer level — which made Claude Code refuse to load
+    /// settings.json with "hooks: Expected array, but received
+    /// undefined" on every event.
+    #[test]
+    fn claude_code_payload_uses_matcher_plus_inner_hooks_shape() {
+        let root = PathBuf::from("/host/hooks/claude-code");
+        let v = build_claude_code_payload(&root, "http://localhost:49374", None);
+        for (event, _) in CLAUDE_CODE_EVENTS {
+            let outer = v
+                .pointer(&format!("/hooks/{event}/0"))
+                .and_then(|s| s.as_object())
+                .unwrap_or_else(|| panic!("missing /hooks/{event}/0"));
+            assert!(outer.contains_key("matcher"), "{event}: missing matcher");
+            let inner = outer
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .unwrap_or_else(|| panic!("{event}: missing inner hooks array"));
+            assert_eq!(inner.len(), 1);
+            let entry = inner[0].as_object().unwrap();
+            assert_eq!(
+                entry.get("type").and_then(|t| t.as_str()),
+                Some("command"),
+                "{event}: inner entry must have type: command"
+            );
+            assert!(
+                entry.contains_key("command"),
+                "{event}: inner entry missing command"
+            );
+        }
     }
 
     #[test]
     fn claude_code_payload_omits_auth_token_when_absent() {
         let root = PathBuf::from("/host/hooks/claude-code");
         let v = build_claude_code_payload(&root, "http://localhost:49374", None);
-        // The env block exists (HOOK_URL is always there) but
-        // AI_MEMORY_AUTH_TOKEN is absent.
+        // The env block lives inside the INNER hook entry (one level
+        // deeper than the legacy shape).
         let env = v
-            .pointer("/hooks/SessionStart/0/env")
+            .pointer("/hooks/SessionStart/0/hooks/0/env")
             .and_then(|e| e.as_object())
             .unwrap();
         assert!(env.contains_key("AI_MEMORY_HOOK_URL"));
@@ -150,7 +203,7 @@ mod tests {
         let root = PathBuf::from("/home/user/.ai-memory/hooks/claude-code");
         let v = build_claude_code_payload(&root, "http://localhost:49374", None);
         let cmd = v
-            .pointer("/hooks/SessionStart/0/command")
+            .pointer("/hooks/SessionStart/0/hooks/0/command")
             .and_then(|s| s.as_str())
             .unwrap();
         assert_eq!(
