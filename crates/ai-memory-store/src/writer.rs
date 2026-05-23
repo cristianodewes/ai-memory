@@ -18,7 +18,7 @@ use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{StoreError, StoreResult};
-use crate::ops::{self, ReorgSummary};
+use crate::ops::{self, PurgeSummary, ReorgSummary};
 
 /// Commands accepted by the writer thread.
 pub(crate) enum WriteCmd {
@@ -89,6 +89,16 @@ pub(crate) enum WriteCmd {
         model: String,
         dim: u32,
         reply: oneshot::Sender<StoreResult<()>>,
+    },
+    /// Delete a project and all its data (pages, sessions, observations,
+    /// handoffs, embeddings) in one transaction. Returns the paths of
+    /// every page file that must be removed from disk by the caller.
+    PurgeProject {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        /// Human-readable `workspace/project` label forwarded into the summary.
+        label: String,
+        reply: oneshot::Sender<StoreResult<PurgeSummary>>,
     },
     Shutdown,
 }
@@ -303,6 +313,33 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Delete a project and all its data in one atomic transaction.
+    ///
+    /// ON DELETE CASCADE propagates the delete through pages, sessions,
+    /// observations, handoffs, and page_embeddings automatically. The
+    /// returned [`PurgeSummary`] includes pre-delete row counts and
+    /// the distinct page paths that the caller must remove from disk.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error from the purge transaction.
+    pub async fn purge_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        label: impl Into<String>,
+    ) -> StoreResult<PurgeSummary> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::PurgeProject {
+            workspace_id,
+            project_id,
+            label: label.into(),
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Retro-fit sessions and their observations to per-cwd projects and
     /// graveyard any mash-up pages. The `plan` slice contains
     /// `(session_id, new_project_id)` pairs. Everything runs in one
@@ -477,6 +514,15 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     dim,
                 );
                 send_or_warn(reply, result, "store_embedding");
+            }
+            WriteCmd::PurgeProject {
+                workspace_id,
+                project_id,
+                label,
+                reply,
+            } => {
+                let result = ops::purge_project(&mut conn, &workspace_id, &project_id, &label);
+                send_or_warn(reply, result, "purge_project");
             }
         }
     }

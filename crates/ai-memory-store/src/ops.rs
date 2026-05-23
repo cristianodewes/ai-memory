@@ -6,7 +6,7 @@
 
 use ai_memory_core::{
     AgentKind, HandoffId, NewHandoff, NewObservation, NewPage, NewSession, ObservationId,
-    ObservationKind, PageId, ProjectId, SessionId,
+    ObservationKind, PageId, ProjectId, SessionId, WorkspaceId,
 };
 
 /// Summary returned by [`reorg_sessions`] and exposed via
@@ -19,6 +19,29 @@ pub struct ReorgSummary {
     pub observations_updated: usize,
     /// `is_latest=1` pages marked `is_latest=0` (mash-up graveyard).
     pub pages_graveyarded: usize,
+}
+
+/// Summary returned by [`purge_project`] and exposed via
+/// [`crate::writer::WriterHandle::purge_project`].
+#[derive(Debug, Default, Clone)]
+pub struct PurgeSummary {
+    /// Human-readable `workspace/project` label. Set by the caller (writer
+    /// only knows IDs); filled in by [`purge_project`] from its parameters.
+    pub label: String,
+    /// Distinct page paths that were present before the delete (all versions,
+    /// not just `is_latest=1`). The admin handler uses this list to remove
+    /// the corresponding files from the wiki directory.
+    pub page_paths: Vec<String>,
+    /// Number of `pages` rows deleted (all versions, not just latest).
+    pub pages_deleted: u64,
+    /// Number of `sessions` rows deleted.
+    pub sessions_deleted: u64,
+    /// Number of `observations` rows deleted.
+    pub observations_deleted: u64,
+    /// Number of `handoffs` rows deleted.
+    pub handoffs_deleted: u64,
+    /// Number of `page_embeddings` rows deleted (cascades through pages).
+    pub embeddings_deleted: u64,
 }
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -618,6 +641,93 @@ pub fn reorg_sessions(
         sessions_moved,
         observations_updated,
         pages_graveyarded,
+    })
+}
+
+/// Delete a project and all its data inside one transaction.
+///
+/// Execution order:
+/// 1. Count rows in each dependent table (pages/all versions, sessions,
+///    observations, handoffs, embeddings) before the delete so we can
+///    report how many rows were removed.
+/// 2. Collect all distinct page paths stored under the project — these are
+///    the on-disk files the caller must clean up after this function returns.
+/// 3. DELETE FROM projects WHERE id = ? — the ON DELETE CASCADE clauses in
+///    V01 + V02 propagate the delete to pages, sessions, observations,
+///    handoffs, and page_embeddings automatically.
+/// 4. Commit and return the [`PurgeSummary`].
+///
+/// The `workspace_project_label` string is passed in by the caller (the
+/// admin handler has the human-readable names; the writer only has IDs) and
+/// forwarded verbatim into [`PurgeSummary::label`] for logging.
+///
+/// # Errors
+/// Returns [`StoreError`] if any SQL statement fails. The transaction is
+/// rolled back automatically on error.
+pub fn purge_project(
+    conn: &mut Connection,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+    workspace_project_label: &str,
+) -> StoreResult<PurgeSummary> {
+    let tx = conn.transaction()?;
+
+    let count = |sql: &str, id: &[u8]| -> StoreResult<u64> {
+        let n: Option<i64> = tx
+            .query_row(sql, rusqlite::params![id], |row| row.get(0))
+            .optional()?;
+        Ok(u64::try_from(n.unwrap_or(0)).unwrap_or(0))
+    };
+
+    let pid = project_id.as_bytes();
+    let pages_deleted = count("SELECT COUNT(*) FROM pages WHERE project_id = ?1", &pid[..])?;
+    let sessions_deleted = count(
+        "SELECT COUNT(*) FROM sessions WHERE project_id = ?1",
+        &pid[..],
+    )?;
+    let observations_deleted = count(
+        "SELECT COUNT(*) FROM observations WHERE project_id = ?1",
+        &pid[..],
+    )?;
+    let handoffs_deleted = count(
+        "SELECT COUNT(*) FROM handoffs WHERE project_id = ?1",
+        &pid[..],
+    )?;
+    // page_embeddings cascade through pages; count pages that have them.
+    let embeddings_deleted = count(
+        "SELECT COUNT(*) FROM page_embeddings \
+         WHERE page_id IN (SELECT id FROM pages WHERE project_id = ?1)",
+        &pid[..],
+    )?;
+
+    // Collect all distinct on-disk paths for the caller to clean up.
+    // We use DISTINCT because multiple versions of the same logical page
+    // share a path; the file only exists once. The statement must be
+    // dropped before we call tx.commit() to release the borrow on `tx`.
+    let page_paths: Vec<String> = {
+        let mut path_stmt = tx.prepare("SELECT DISTINCT path FROM pages WHERE project_id = ?1")?;
+        path_stmt
+            .query_map(rusqlite::params![&pid[..]], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?
+    };
+
+    // Cascade handles pages / sessions / observations / handoffs /
+    // page_embeddings. The workspace row is intentionally left intact —
+    // other projects may still live there.
+    tx.execute(
+        "DELETE FROM projects WHERE id = ?1 AND workspace_id = ?2",
+        rusqlite::params![&pid[..], workspace_id.as_bytes()],
+    )?;
+
+    tx.commit()?;
+    Ok(PurgeSummary {
+        label: workspace_project_label.to_string(),
+        page_paths,
+        pages_deleted,
+        sessions_deleted,
+        observations_deleted,
+        handoffs_deleted,
+        embeddings_deleted,
     })
 }
 

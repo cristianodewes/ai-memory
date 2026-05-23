@@ -25,7 +25,9 @@ use ai_memory_consolidate::{
 };
 use ai_memory_core::{ProjectId, SessionId, WorkspaceId};
 use ai_memory_llm::{Embedder, LlmProvider};
-use ai_memory_store::{DecayParams, ReaderPool, StoreError, WriterHandle, f32_vec_to_bytes};
+use ai_memory_store::{
+    DecayParams, PurgeSummary, ReaderPool, StoreError, WriterHandle, f32_vec_to_bytes,
+};
 use ai_memory_wiki::Wiki;
 use axum::Json;
 use axum::Router;
@@ -94,6 +96,7 @@ fn default_max_input_tokens() -> usize {
 /// - `POST /admin/forget-sweep`
 /// - `POST /admin/embed`
 /// - `POST /admin/commit`
+/// - `POST /admin/purge-project`
 pub fn admin_router(state: AdminState) -> Router {
     Router::new()
         .route("/admin/bootstrap", post(handle_bootstrap))
@@ -104,6 +107,7 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/admin/forget-sweep", post(handle_forget_sweep))
         .route("/admin/embed", post(handle_embed))
         .route("/admin/commit", post(handle_commit))
+        .route("/admin/purge-project", post(handle_purge_project))
         .with_state(Arc::new(state))
 }
 
@@ -837,4 +841,151 @@ async fn handle_commit(
             Json(serde_json::json!({ "error": e.to_string() })),
         ),
     }
+}
+
+// ---------------------------------------------------------------------
+// purge-project
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/purge-project`.
+#[derive(Deserialize)]
+struct PurgeProjectRequest {
+    /// Workspace name. The workspace must already exist; we 404 if absent.
+    workspace: String,
+    /// Project name. The project must already exist; we 404 if absent.
+    project: String,
+    /// Mandatory confirmation flag. Without `confirm: true` the server
+    /// returns 400 — purging is destructive and irreversible.
+    confirm: bool,
+}
+
+/// Wire-format summary returned by `POST /admin/purge-project`.
+#[derive(Debug, Serialize)]
+pub struct PurgeProjectReport {
+    /// Human-readable `workspace/project` label.
+    pub label: String,
+    /// Number of `pages` rows deleted (all versions).
+    pub pages_deleted: u64,
+    /// Number of `sessions` rows deleted.
+    pub sessions_deleted: u64,
+    /// Number of `observations` rows deleted.
+    pub observations_deleted: u64,
+    /// Number of `handoffs` rows deleted.
+    pub handoffs_deleted: u64,
+    /// Number of `page_embeddings` rows deleted.
+    pub embeddings_deleted: u64,
+    /// Paths of wiki files that were removed from disk.
+    pub files_deleted: Vec<String>,
+    /// Paths that could not be removed from disk (non-fatal; DB rows are gone).
+    pub files_failed: Vec<String>,
+}
+
+impl From<&PurgeSummary> for PurgeProjectReport {
+    fn from(s: &PurgeSummary) -> Self {
+        Self {
+            label: s.label.clone(),
+            pages_deleted: s.pages_deleted,
+            sessions_deleted: s.sessions_deleted,
+            observations_deleted: s.observations_deleted,
+            handoffs_deleted: s.handoffs_deleted,
+            embeddings_deleted: s.embeddings_deleted,
+            files_deleted: Vec::new(),
+            files_failed: Vec::new(),
+        }
+    }
+}
+
+async fn handle_purge_project(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<PurgeProjectRequest>,
+) -> impl IntoResponse {
+    if !req.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "destructive operation requires confirm=true"
+            })),
+        );
+    }
+
+    // Look up workspace and project IDs without auto-creating.
+    let ws_id = match state.reader.find_workspace(req.workspace.clone()).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("workspace '{}' not found", req.workspace)
+                })),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+    };
+
+    let proj_id = match state.reader.find_project(ws_id, req.project.clone()).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "project '{}' not found in workspace '{}'",
+                        req.project, req.workspace
+                    )
+                })),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+    };
+
+    let label = format!("{}/{}", req.workspace, req.project);
+    let summary = match state.writer.purge_project(ws_id, proj_id, &label).await {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+    };
+
+    // Remove wiki files. Partial failures are accumulated but never abort
+    // the response — the DB rows are already gone; partial file cleanup is
+    // better than returning an error and leaving the caller confused.
+    let mut files_deleted: Vec<String> = Vec::new();
+    let mut files_failed: Vec<String> = Vec::new();
+    for raw_path in &summary.page_paths {
+        match ai_memory_core::PagePath::new(raw_path.clone()) {
+            Ok(pp) => match state.wiki.delete_page(&pp) {
+                Ok(()) => files_deleted.push(raw_path.clone()),
+                Err(e) => {
+                    warn!(path = %raw_path, error = %e, "purge-project: failed to delete wiki file");
+                    files_failed.push(raw_path.clone());
+                }
+            },
+            Err(e) => {
+                warn!(path = %raw_path, error = %e, "purge-project: invalid page path skipped");
+                files_failed.push(raw_path.clone());
+            }
+        }
+    }
+
+    let mut report = PurgeProjectReport::from(&summary);
+    report.files_deleted = files_deleted;
+    report.files_failed = files_failed;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+    )
 }

@@ -1007,6 +1007,60 @@ impl ReaderPool {
         .await
     }
 
+    /// Look up a workspace id by name without creating it.
+    ///
+    /// Returns `None` when no workspace with the given name exists.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn find_workspace(&self, name: String) -> StoreResult<Option<WorkspaceId>> {
+        self.with_conn(move |conn| {
+            let row_opt = conn
+                .query_row(
+                    "SELECT id FROM workspaces WHERE name = ?1",
+                    params![name],
+                    |row| {
+                        let bytes: Vec<u8> = row.get(0)?;
+                        Ok(bytes)
+                    },
+                )
+                .optional()?;
+            row_opt
+                .map(|bytes| WorkspaceId::from_slice(&bytes).map_err(StoreError::from))
+                .transpose()
+        })
+        .await
+    }
+
+    /// Look up a project id by `(workspace_id, name)` without creating it.
+    ///
+    /// Returns `None` when no project with the given name exists in the workspace.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn find_project(
+        &self,
+        workspace_id: WorkspaceId,
+        name: String,
+    ) -> StoreResult<Option<ProjectId>> {
+        self.with_conn(move |conn| {
+            let row_opt = conn
+                .query_row(
+                    "SELECT id FROM projects WHERE workspace_id = ?1 AND name = ?2",
+                    params![workspace_id.as_bytes(), name],
+                    |row| {
+                        let bytes: Vec<u8> = row.get(0)?;
+                        Ok(bytes)
+                    },
+                )
+                .optional()?;
+            row_opt
+                .map(|bytes| ProjectId::from_slice(&bytes).map_err(StoreError::from))
+                .transpose()
+        })
+        .await
+    }
+
     /// Return aggregate counts for the `status` view.
     ///
     /// # Errors

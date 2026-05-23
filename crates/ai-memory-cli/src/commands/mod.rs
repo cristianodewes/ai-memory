@@ -15,6 +15,7 @@ pub mod install_instructions;
 pub mod install_mcp;
 pub mod lint;
 pub mod llm_test;
+pub mod purge_project;
 pub mod render_shared;
 pub mod reorg;
 pub mod reset;

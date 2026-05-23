@@ -115,6 +115,24 @@ impl Wiki {
         parse(&raw)
     }
 
+    /// Delete the on-disk file for `path`.
+    ///
+    /// Returns `Ok(())` when the file was removed or did not exist (idempotent).
+    /// The file watcher will observe the deletion; the sha256 short-circuit in
+    /// the watcher's reindex path means a missing file produces a graceful
+    /// no-op rather than an error.
+    ///
+    /// # Errors
+    /// Returns [`WikiError::Io`] for any OS error other than "not found".
+    pub fn delete_page(&self, path: &PagePath) -> WikiResult<()> {
+        let abs = self.abs_path(path);
+        match std::fs::remove_file(&abs) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(crate::WikiError::Io(e)),
+        }
+    }
+
     /// Cloneable handle to the underlying store writer.
     #[must_use]
     pub fn writer(&self) -> &WriterHandle {

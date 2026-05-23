@@ -85,6 +85,10 @@ pub enum Command {
     /// `is_latest=false` (they were a multi-project mash-up) so the
     /// next consolidation can regenerate them per-project. Idempotent.
     Reorg(ReorgArgs),
+    /// Permanently delete a project and ALL its data (pages, sessions,
+    /// observations, handoffs, embeddings, on-disk wiki files).
+    /// This is irreversible — requires `--confirm`.
+    PurgeProject(PurgeProjectArgs),
 }
 
 /// Arguments for `reorg`.
@@ -93,6 +97,22 @@ pub struct ReorgArgs {
     /// Show what would change without writing.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+/// Arguments for `purge-project`.
+#[derive(Debug, Args)]
+pub struct PurgeProjectArgs {
+    /// Workspace name. Defaults to "default".
+    #[arg(long, default_value = "default")]
+    pub workspace: String,
+    /// Project name. When omitted, auto-derived from the basename of
+    /// the current git repo root (or CWD if no git repo).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// REQUIRED for the purge to run. Without this flag the CLI errors
+    /// out — purging is destructive and irreversible.
+    #[arg(long)]
+    pub confirm: bool,
 }
 
 /// Arguments for `install-instructions`.
