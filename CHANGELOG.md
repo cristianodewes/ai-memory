@@ -10,9 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.ai-memory.toml` marker file lets a directory tree declare its
   `workspace` (required) and `project` (optional) without depending on
   `basename($cwd)`. Lifecycle hook scripts walk up from `cwd` to find
-  the closest marker and forward the declared names as
-  `&workspace=X&project=Y` query params on `POST /hook` and
-  `GET /handoff`. Server accepts the new params as optional overrides;
+  the closest marker and forward `cwd` plus the declared names as
+  query params on `POST /hook` and `GET /handoff`. Server accepts the
+  new params as optional overrides;
   absent marker means the previous behaviour (`workspace = "default"`,
   `project = basename(cwd)`) — fully backward compatible. See
   [`docs/marker-file.md`](docs/marker-file.md).

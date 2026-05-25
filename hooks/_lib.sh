@@ -54,9 +54,10 @@ ai_memory_url_encode() {
         | sed 's/%/%25/g; s/&/%26/g; s/=/%3D/g; s/?/%3F/g; s/#/%23/g; s/ /%20/g'
 }
 
-# Build a `&workspace=X&project=Y` suffix from the marker file walked up
-# from "$1". Returns the suffix (with the leading `&`) or nothing. The
-# server tolerates either key being absent.
+# Build a query-string suffix from the marker file walked up from "$1".
+# Returns the suffix (with the leading `&`) or nothing. `cwd` is included
+# whenever a marker exists so `GET /handoff` can resolve workspace-only
+# markers by combining `workspace` with basename(cwd).
 ai_memory_marker_qs() {
     cwd="$1"
     [ -z "$cwd" ] && return 0
@@ -64,7 +65,7 @@ ai_memory_marker_qs() {
     [ -z "$marker" ] && return 0
     ws=$(ai_memory_parse_toml_key "$marker" workspace)
     pr=$(ai_memory_parse_toml_key "$marker" project)
-    qs=""
+    qs="&cwd=$(ai_memory_url_encode "$cwd")"
     [ -n "$ws" ] && qs="${qs}&workspace=$(ai_memory_url_encode "$ws")"
     [ -n "$pr" ] && qs="${qs}&project=$(ai_memory_url_encode "$pr")"
     printf '%s' "$qs"

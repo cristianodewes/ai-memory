@@ -1,20 +1,15 @@
 #!/bin/sh
 # opencode pre-compact hook.
-# Forwards the event JSON to the ai-memory server. Adds an
-# Authorization: Bearer header when AI_MEMORY_AUTH_TOKEN is set in
-# this hook's environment (set it via install-hooks --auth-token).
+# Forwards the event JSON to the ai-memory server, fire-and-forget.
+_lib_dir="$(dirname "$0")"
+[ -f "$_lib_dir/_lib.sh" ] || _lib_dir="$_lib_dir/.."
+. "$_lib_dir/_lib.sh"
+
 SERVER="${AI_MEMORY_HOOK_URL:-http://127.0.0.1:49374}"
-post_hook() {
-    if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
-        curl -s --max-time 0.5 -X POST "$1" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN" \
-            --data-binary @-
-    else
-        curl -s --max-time 0.5 -X POST "$1" \
-            -H "Content-Type: application/json" \
-            --data-binary @-
-    fi
-}
-post_hook "$SERVER/hook?event=pre-compact&agent=open-code" >/dev/null 2>&1 || true
+PAYLOAD=$(cat)
+CWD=$(ai_memory_extract_cwd "$PAYLOAD")
+QS=$(ai_memory_marker_qs "$CWD")
+
+printf '%s' "$PAYLOAD" \
+    | ai_memory_post_hook "$SERVER/hook?event=pre-compact&agent=open-code${QS}" >/dev/null 2>&1 || true
 exit 0

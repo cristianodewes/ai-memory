@@ -946,8 +946,17 @@ fn render_agent(
 /// Errors propagate when source is missing, the staging dir
 /// can't be created, or any file copy fails.
 fn stage_hook_scripts(source_dir: &Path, agent_label: &str) -> Result<PathBuf> {
-    let dest_root = dirs::data_local_dir()
-        .context("could not locate the user data-local directory (e.g. ~/.local/share)")?
+    let data_dir = dirs::data_local_dir()
+        .context("could not locate the user data-local directory (e.g. ~/.local/share)")?;
+    stage_hook_scripts_in(source_dir, agent_label, &data_dir)
+}
+
+fn stage_hook_scripts_in(
+    source_dir: &Path,
+    agent_label: &str,
+    data_local_dir: &Path,
+) -> Result<PathBuf> {
+    let dest_root = data_local_dir
         .join("ai-memory")
         .join("hooks")
         .join(agent_label);
@@ -1301,7 +1310,8 @@ mod tests {
         fs::write(bundle.join("_lib.sh"), "# shared helper\n").unwrap();
         stub_scripts(&agent_src, &["session-start.sh", "post-tool-use.sh"]);
 
-        let staged = stage_hook_scripts(&agent_src, "stage-shared-lib").unwrap();
+        let data_dir = tmp.path().join("data");
+        let staged = stage_hook_scripts_in(&agent_src, "stage-shared-lib", &data_dir).unwrap();
         assert!(staged.join("session-start.sh").exists());
         assert!(staged.join("post-tool-use.sh").exists());
         assert!(
@@ -1327,7 +1337,8 @@ mod tests {
         // Note: no _lib.sh in `bundle`.
         stub_scripts(&agent_src, &["session-start.sh"]);
 
-        let staged = stage_hook_scripts(&agent_src, "stage-no-lib").unwrap();
+        let data_dir = tmp.path().join("data");
+        let staged = stage_hook_scripts_in(&agent_src, "stage-no-lib", &data_dir).unwrap();
         assert!(staged.join("session-start.sh").exists());
         assert!(!staged.join("_lib.sh").exists());
     }

@@ -59,11 +59,11 @@ assert_eq "extract cwd from empty json"  ""            "$(ai_memory_extract_cwd 
 
 # --- marker_qs --------------------------------------------------------
 QS=$(ai_memory_marker_qs "$TMP/a/b/c")
-assert_eq "marker_qs single key" "&workspace=deep" "$QS"
+assert_eq "marker_qs single key" "&cwd=$TMP/a/b/c&workspace=deep" "$QS"
 
 printf 'workspace = "ws1"\nproject = "p1"\n' >"$TMP/a/b/.ai-memory.toml"
 QS2=$(ai_memory_marker_qs "$TMP/a/b/c")
-assert_eq "closer marker wins" "&workspace=ws1&project=p1" "$QS2"
+assert_eq "closer marker wins" "&cwd=$TMP/a/b/c&workspace=ws1&project=p1" "$QS2"
 
 QS3=$(ai_memory_marker_qs "$TMP/nonexistent")
 assert_eq "no marker -> empty qs" "" "$QS3"

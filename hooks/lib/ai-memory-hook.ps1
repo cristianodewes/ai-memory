@@ -36,7 +36,7 @@ function Get-AiMemoryMarkerQuery {
     param([string] $Cwd)
     $marker = Get-AiMemoryMarkerToml -Cwd $Cwd
     if (-not $marker) { return "" }
-    $qs = ""
+    $qs = "&cwd=$([uri]::EscapeDataString($Cwd))"
     $ws = Get-AiMemoryTomlKey -File $marker -Key "workspace"
     if ($ws) { $qs += "&workspace=$([uri]::EscapeDataString($ws))" }
     $proj = Get-AiMemoryTomlKey -File $marker -Key "project"

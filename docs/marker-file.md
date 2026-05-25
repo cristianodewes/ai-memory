@@ -25,7 +25,10 @@ ai-memory or running CLI commands per directory.
 
 `.ai-memory.toml` in **any ancestor** of your `cwd`. Lifecycle hooks
 walk up from `cwd` toward `$HOME` (or `/` if `$HOME` is unset) and
-use the **first** marker found. Closer markers override outer ones.
+use the **first** marker found. Closer markers override outer ones. When
+a marker is found, hook scripts also forward the current `cwd` so
+workspace-only markers can still resolve `project = basename(cwd)` for
+handoff lookups.
 
 ## Schema
 
