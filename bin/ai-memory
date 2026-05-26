@@ -15,6 +15,9 @@
 #   AI_MEMORY_DOCKER        docker command (default: docker; e.g. "podman")
 #   AI_MEMORY_DATA_VOLUME   named volume mounted at /data (default: ai-memory-data)
 #   AI_MEMORY_DATA_DIR      host path to bind-mount at /data instead (rare)
+#   AI_MEMORY_SERVER_URL    server URL for thin-client commands; if unset,
+#                           the wrapper reaches the host loopback server
+#                           started by the README quick start.
 #   AI_MEMORY_NO_TTY=1      force non-interactive even on a real tty
 #   AI_MEMORY_NO_VERSION_CHECK=1  skip the once-per-day update check
 set -euo pipefail
@@ -226,6 +229,25 @@ do
   fi
 done
 
+# The wrapper itself runs the CLI inside a short-lived helper container, while
+# the README server runs in the long-lived ai-memory container and publishes
+# 127.0.0.1:49374 on the host. Inside a normal bridge-network helper,
+# 127.0.0.1 would mean "this helper container", so thin-client commands like
+# `status` and `bootstrap` could not reach the default server.
+NETWORK_ARGS=()
+case "$(uname -s 2>/dev/null || true)" in
+  Linux)
+    if [ -z "${AI_MEMORY_SERVER_URL:-}" ]; then
+      NETWORK_ARGS=(--network host)
+    fi
+    ;;
+  Darwin)
+    if [ -z "${AI_MEMORY_SERVER_URL:-}" ]; then
+      ENV_ARGS+=(-e "AI_MEMORY_SERVER_URL=http://host.docker.internal:49374")
+    fi
+    ;;
+esac
+
 # Mount the data dir at /data so commands that open the store
 # (status, bootstrap, search, write-page, lint, embed, …) see the
 # same content the server sees. Bind-mount a host path if the user
@@ -258,6 +280,7 @@ fi
 # `commands::resolve_project_name` helper checks this env var first
 # and falls back to the cwd basename only if it's unset.
 exec "${DOCKER}" run --rm "${TTY_ARGS[@]}" \
+  "${NETWORK_ARGS[@]}" \
   -v "${HOME}:${HOME}" \
   -v "${PWD}:/work" \
   -w /work \

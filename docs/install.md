@@ -444,15 +444,15 @@ project's existing history into seed pages so the first session has
 warm context.
 
 ```bash
-docker run --rm \
-    -v ai-memory-data:/data \
-    -v "$PWD:/repo" \
-    -e AI_MEMORY_AUTH_TOKEN="$TOKEN" \
-    -e AI_MEMORY_LLM_PROVIDER=anthropic \
-    -e ANTHROPIC_API_KEY=sk-ant-... \
-    akitaonrails/ai-memory:latest \
-    bootstrap --repo-path /repo
+cd /path/to/project
+ai-memory bootstrap
 ```
+
+If you installed the Docker wrapper from the quick start and started the
+server on `127.0.0.1:49374`, the wrapper automatically reaches that host
+loopback server from its short-lived helper container. Set
+`AI_MEMORY_SERVER_URL=http://<server>:49374` only when the server is
+remote or uses a custom host/port.
 
 **What gets ingested by default:**
 
@@ -497,7 +497,7 @@ which sources would actually be sent + how many tokens that
 represents. Output is JSON to stdout.
 
 ```bash
-docker run --rm -v "$PWD:/repo" ... bootstrap --repo-path /repo --dry-run
+ai-memory bootstrap --dry-run
 {
   "sources_collected": 117,
   "sources_sent": 22,
@@ -545,6 +545,12 @@ Then wire up the agent CLI. Both commands default to no auth and
 ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
 ```
+
+The installed Docker wrapper runs CLI commands inside a short-lived
+helper container. For local loopback servers, it automatically bridges
+that helper back to the host's `127.0.0.1:49374`, so `ai-memory status`,
+`ai-memory search`, and `ai-memory bootstrap` work with the same default
+URL as the generated agent config.
 
 ### Docker compose alternative
 

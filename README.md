@@ -177,6 +177,11 @@ write. The hook scripts are staged into
 overwrites them so future image updates ship updated hooks. Drop
 `--apply` to print the snippet instead of mutating.
 
+The Docker wrapper also bridges thin-client commands such as
+`ai-memory status` and `ai-memory bootstrap` back to the host's
+loopback server. With the local Docker quick start above, no
+`AI_MEMORY_SERVER_URL` override is needed.
+
 To remove ai-memory later, run `ai-memory uninstall --apply` from the
 same host environment. It removes ai-memory-owned config entries and
 generated plugin files only after matching their ai-memory signatures;

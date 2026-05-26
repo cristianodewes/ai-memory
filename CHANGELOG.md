@@ -131,6 +131,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preventing shell-active token/URL fragments.
 - OpenClaw's generated plugin now forwards marker-file routing params just like
   the OpenCode and OMP generated integrations.
+- The Linux/macOS Docker wrapper now lets thin-client commands such as
+  `status` and `bootstrap` reach the local quick-start server bound on the
+  host's `127.0.0.1:49374`.
 
 ## [0.1.3] - 2026-05-24
 
