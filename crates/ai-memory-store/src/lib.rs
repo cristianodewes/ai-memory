@@ -694,4 +694,74 @@ mod tests {
             .unwrap();
         assert!(none.is_none());
     }
+
+    #[tokio::test]
+    async fn delete_stale_page_embeddings_removes_mismatched_rows() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "test", None)
+            .await
+            .unwrap();
+        let p1 = store
+            .writer
+            .upsert_page(sample_page(ws, proj, "a.md", "body a"))
+            .await
+            .unwrap();
+        let p2 = store
+            .writer
+            .upsert_page(sample_page(ws, proj, "b.md", "body b"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .store_embedding(
+                p1,
+                vec![0u8; 4],
+                "google".into(),
+                "models/gemini-embedding-001".into(),
+                768,
+            )
+            .await
+            .unwrap();
+        store
+            .writer
+            .store_embedding(
+                p2,
+                vec![1u8; 4],
+                "openai".into(),
+                "openai/text-embedding-3-small".into(),
+                1536,
+            )
+            .await
+            .unwrap();
+        let n = store
+            .writer
+            .delete_stale_page_embeddings(
+                ws,
+                Some(proj),
+                "openai".into(),
+                "openai/text-embedding-3-small".into(),
+                1536,
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let mismatch = store
+            .reader
+            .embedding_meta_for_mismatch(
+                "openai".into(),
+                "openai/text-embedding-3-small".into(),
+                1536,
+            )
+            .await
+            .unwrap();
+        assert!(mismatch.is_empty());
+    }
 }

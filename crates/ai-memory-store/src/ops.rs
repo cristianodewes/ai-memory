@@ -822,6 +822,66 @@ pub fn purge_project(
     })
 }
 
+/// Remove embedding rows in a workspace/project scope whose `(provider, model, dim)`
+/// does not match the configured triple, plus rows tied to superseded pages.
+pub fn delete_stale_page_embeddings(
+    conn: &mut Connection,
+    workspace_id: &WorkspaceId,
+    project_id: Option<&ProjectId>,
+    provider: &str,
+    model: &str,
+    dim: u32,
+) -> StoreResult<u64> {
+    let tx = conn.transaction()?;
+    let (n, orphans) = if let Some(project_id) = project_id {
+        let n = tx.execute(
+            "DELETE FROM page_embeddings \
+             WHERE page_id IN (\
+                SELECT id FROM pages \
+                WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1\
+             ) \
+               AND NOT (provider = ?3 AND model = ?4 AND dim = CAST(?5 AS INTEGER))",
+            params![
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                provider,
+                model,
+                dim
+            ],
+        )?;
+        let orphans = tx.execute(
+            "DELETE FROM page_embeddings \
+             WHERE page_id IN (\
+                SELECT id FROM pages \
+                WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 0\
+             )",
+            params![workspace_id.as_bytes(), project_id.as_bytes()],
+        )?;
+        (n, orphans)
+    } else {
+        let n = tx.execute(
+            "DELETE FROM page_embeddings \
+             WHERE page_id IN (\
+                SELECT id FROM pages \
+                WHERE workspace_id = ?1 AND is_latest = 1\
+             ) \
+               AND NOT (provider = ?2 AND model = ?3 AND dim = CAST(?4 AS INTEGER))",
+            params![workspace_id.as_bytes(), provider, model, dim],
+        )?;
+        let orphans = tx.execute(
+            "DELETE FROM page_embeddings \
+             WHERE page_id IN (\
+                SELECT id FROM pages \
+                WHERE workspace_id = ?1 AND is_latest = 0\
+             )",
+            params![workspace_id.as_bytes()],
+        )?;
+        (n, orphans)
+    };
+    tx.commit()?;
+    Ok(u64::try_from(n.saturating_add(orphans)).unwrap_or(0))
+}
+
 #[cfg(test)]
 mod tests {
     //! Focused unit tests for the load-bearing mutating SQL paths.
@@ -1227,5 +1287,85 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM page_embeddings", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn delete_stale_page_embeddings_removes_mismatched_rows() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let p1 = upsert_page(&mut conn, &page(ws, proj, "a.md", "body a")).unwrap();
+        let p2 = upsert_page(&mut conn, &page(ws, proj, "b.md", "body b")).unwrap();
+        let p3 = upsert_page(&mut conn, &page(ws, other, "c.md", "body c")).unwrap();
+        let old = upsert_page(&mut conn, &page(ws, proj, "old.md", "old body")).unwrap();
+        let _new = upsert_page(&mut conn, &page(ws, proj, "old.md", "new body")).unwrap();
+        store_embedding(
+            &mut conn,
+            &p1,
+            &[0u8; 4],
+            "google",
+            "models/gemini-embedding-001",
+            768,
+        )
+        .unwrap();
+        store_embedding(
+            &mut conn,
+            &p3,
+            &[2u8; 4],
+            "google",
+            "models/gemini-embedding-001",
+            768,
+        )
+        .unwrap();
+        store_embedding(
+            &mut conn,
+            &p2,
+            &[1u8; 4],
+            "openai",
+            "openai/text-embedding-3-small",
+            1536,
+        )
+        .unwrap();
+        store_embedding(
+            &mut conn,
+            &old,
+            &[3u8; 4],
+            "openai",
+            "openai/text-embedding-3-small",
+            1536,
+        )
+        .unwrap();
+        let n = super::delete_stale_page_embeddings(
+            &mut conn,
+            &ws,
+            Some(&proj),
+            "openai",
+            "openai/text-embedding-3-small",
+            1536,
+        )
+        .unwrap();
+        assert_eq!(n, 2);
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM page_embeddings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 2);
+        let model: String = conn
+            .query_row(
+                "SELECT model FROM page_embeddings WHERE page_id = ?1",
+                params![&p2.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(model, "openai/text-embedding-3-small");
+        let other_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM page_embeddings WHERE page_id = ?1",
+                params![&p3.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            other_rows, 1,
+            "explicit project purge must not touch siblings"
+        );
     }
 }

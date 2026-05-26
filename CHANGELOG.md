@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - OpenAI-compatible embedding calls now truncate oversized page bodies, surface
   provider errors returned in HTTP 200 bodies, retry bounded HTTP 429 responses,
   and may reuse `LLM_API_KEY` when a custom embedding base URL is configured.
+- `ai-memory embed --force` without `--project` now re-embeds every project in
+  the workspace and purges stale/superseded embedding rows in the same scope.
 
 ## [0.2.0] - 2026-05-26
 ### Added

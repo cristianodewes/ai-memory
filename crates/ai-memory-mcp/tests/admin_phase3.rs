@@ -10,6 +10,7 @@
 use ai_memory_core::{
     AgentKind, NewObservation, NewPage, NewSession, ObservationKind, PagePath, SessionId, Tier,
 };
+use ai_memory_llm::SyntheticEmbedder;
 use ai_memory_mcp::{AdminState, admin_router};
 use ai_memory_store::{DecayParams, Store};
 use ai_memory_wiki::Wiki;
@@ -17,6 +18,7 @@ use ai_memory_wiki::WritePageRequest;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
+use std::sync::Arc;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -323,6 +325,90 @@ async fn embed_without_embedder_returns_503() {
     assert!(
         body["error"].as_str().unwrap_or("").contains("embedder"),
         "error must mention embedder: {body}"
+    );
+}
+
+#[tokio::test]
+async fn embed_all_projects_rebuilds_workspace_projects() {
+    let tmp = TempDir::new().unwrap();
+    let (mut state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let alpha = store
+        .writer
+        .get_or_create_project(ws, "alpha", None)
+        .await
+        .unwrap();
+    let beta = store
+        .writer
+        .get_or_create_project(ws, "beta", None)
+        .await
+        .unwrap();
+
+    state
+        .wiki
+        .write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: alpha,
+            path: PagePath::new("notes/a.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "A", "tier": "semantic"}),
+            body: "alpha content".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some("A".into()),
+        })
+        .await
+        .unwrap();
+    state
+        .wiki
+        .write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: beta,
+            path: PagePath::new("notes/b.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "B", "tier": "semantic"}),
+            body: "beta content".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some("B".into()),
+        })
+        .await
+        .unwrap();
+
+    state.embedder = Some(Arc::new(SyntheticEmbedder::new(64)));
+    let resp = post(
+        state,
+        "/admin/embed",
+        json!({
+            "workspace": "default",
+            "reembed": true,
+            "all_projects": true,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_json(resp).await;
+    assert_eq!(body["embedded"].as_u64().unwrap(), 2, "{body}");
+    assert_eq!(
+        store
+            .reader
+            .embedded_page_ids(ws, alpha, "synthetic".into(), "bag-of-words-v1".into(), 64)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .reader
+            .embedded_page_ids(ws, beta, "synthetic".into(), "bag-of-words-v1".into(), 64)
+            .await
+            .unwrap()
+            .len(),
+        1
     );
 }
 
