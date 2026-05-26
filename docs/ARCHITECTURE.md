@@ -307,8 +307,10 @@ AI_MEMORY_LLM_BASE_URL     for openai-compat (Ollama, vLLM)
 ```
 AI_MEMORY_EMBEDDING_PROVIDER   openai | voyage | google | gemini
 AI_MEMORY_EMBEDDING_MODEL      e.g. text-embedding-3-small, gemini-embedding-001
+AI_MEMORY_EMBEDDING_BASE_URL   optional OpenAI-compatible embeddings endpoint
 AI_MEMORY_EMBEDDING_DIM        1536 (OpenAI), 1024 (Voyage), 768 (Google)
 OPENAI_API_KEY / VOYAGE_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY
+LLM_API_KEY                    accepted for openai embeddings only with a custom base URL
 ```
 
 ## Future work
