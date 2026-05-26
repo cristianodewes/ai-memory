@@ -97,7 +97,11 @@ impl GoogleEmbedder {
             if status.as_u16() == 429 && attempt < 5 {
                 attempt += 1;
                 let delay = Duration::from_secs(2u64.saturating_pow(attempt));
-                debug!(attempt, ?delay, "google embedContent rate-limited; retrying");
+                debug!(
+                    attempt,
+                    ?delay,
+                    "google embedContent rate-limited; retrying"
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }

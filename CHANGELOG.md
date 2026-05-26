@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Filesystem watcher now reindexes a project when backends report only a
   parent-directory event, improving external editor capture on macOS/FSEvents.
+- OpenAI-compatible embedding calls now truncate oversized page bodies, surface
+  provider errors returned in HTTP 200 bodies, retry bounded HTTP 429 responses,
+  and may reuse `LLM_API_KEY` when a custom embedding base URL is configured.
 
 ## [0.2.0] - 2026-05-26
 ### Added

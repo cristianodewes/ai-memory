@@ -117,14 +117,9 @@ struct OpenAiEmbeddingDatum {
 
 /// Parse OpenAI-compatible embedding responses, including OpenRouter error bodies.
 fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResult<Vec<f32>> {
-    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| {
-        LlmError::Provider {
-            status,
-            body: truncate_with_ellipsis(
-                &format!("openai embeddings json: {e}; body={body}"),
-                1024,
-            ),
-        }
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| LlmError::Provider {
+        status,
+        body: truncate_with_ellipsis(&format!("openai embeddings json: {e}; body={body}"), 1024),
     })?;
     if let Some(err) = v.get("error") {
         let msg = err
@@ -166,15 +161,14 @@ fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResult<Vec<f32>>
         }
     }
     // Strict OpenAI shape fallback.
-    let parsed: OpenAiEmbeddingResponse = serde_json::from_value(v).map_err(|e| {
-        LlmError::Provider {
+    let parsed: OpenAiEmbeddingResponse =
+        serde_json::from_value(v).map_err(|e| LlmError::Provider {
             status,
             body: truncate_with_ellipsis(
                 &format!("openai embeddings shape: {e}; body={body}"),
                 1024,
             ),
-        }
-    })?;
+        })?;
     let first = parsed.data.into_iter().next().ok_or_else(|| {
         LlmError::UnexpectedShape(format!(
             "openai response had no data[0]; body={}",

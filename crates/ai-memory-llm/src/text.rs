@@ -35,12 +35,16 @@ pub(crate) fn suffix_within_bytes(s: &str, max_bytes: usize) -> &str {
 /// both a token budget (optimistic prose) and a hard byte ceiling.
 pub(crate) fn truncate_for_embedding(text: &str, max_tokens: usize) -> String {
     const HARD_MAX_BYTES: usize = 8_000;
+    const ELLIPSIS_BYTES: usize = "…".len();
     let token_budget_bytes = max_tokens.saturating_mul(3);
     let max_bytes = token_budget_bytes.min(HARD_MAX_BYTES);
     if text.len() <= max_bytes {
         return text.to_string();
     }
-    truncate_with_ellipsis(text, max_bytes.saturating_sub(1))
+    if max_bytes <= ELLIPSIS_BYTES {
+        return String::new();
+    }
+    truncate_with_ellipsis(text, max_bytes - ELLIPSIS_BYTES)
 }
 
 #[cfg(test)]
@@ -73,6 +77,6 @@ mod tests {
         let out = truncate_for_embedding(&long, 6000);
         assert!(out.ends_with('…'));
         assert!(out.len() < long.len());
-        assert!(out.len() <= 8_000 + 4);
+        assert!(out.len() <= 8_000);
     }
 }
