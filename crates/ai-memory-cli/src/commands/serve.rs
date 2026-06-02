@@ -1,5 +1,6 @@
 //! `ai-memory serve` — MCP server with optional filesystem watcher.
 
+use std::convert::Infallible;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +25,7 @@ use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use tokio_util::sync::CancellationToken;
+use tower::service_fn;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tracing::info;
@@ -297,7 +299,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 &args.web_slug,
                 &base_href,
                 &base_path,
-            );
+            )?;
             let router = apply_http_layers(router, auth_state, config.allowed_hosts.clone());
             // Host the entire surface under the configured base path. Empty
             // base = root (unchanged). The auth/host layers are already
@@ -885,9 +887,9 @@ fn mount_web_router(
     web_slug: &str,
     base_href: &str,
     base_path: &str,
-) -> axum::Router {
+) -> Result<axum::Router> {
     if !enable_web {
-        return router;
+        return Ok(router);
     }
     // Register the web surfaces BEFORE applying the bearer middleware. In
     // axum 0.8, `.layer()` only attaches to routes registered before the
@@ -928,24 +930,16 @@ fn mount_web_router(
     // URLs resolve under `{base_path}{web_slug}`.
     if let Some(dir) = web_ui_dir {
         let dir = dir.to_path_buf();
-        let raw = std::fs::read_to_string(dir.join("index.html")).unwrap_or_default();
+        let raw = std::fs::read_to_string(dir.join("index.html"))
+            .with_context(|| format!("reading custom web UI index at {}", dir.display()))?;
         let injected = inject_base_path_meta(&inject_base_href(&raw, base_href), base_path);
         info!(mount, base_href, base_path, "custom web UI mounted");
-        // Assets are served as files; any unmatched path (SPA client route)
-        // falls back to the injected index. `append_index_html_on_directories`
-        // is off so the directory index also flows through the injecting
-        // fallback rather than serving the raw on-disk index.html.
-        let spa = ServeDir::new(dir)
-            .append_index_html_on_directories(false)
-            .fallback(axum::routing::get(move || {
-                let body = injected.clone();
-                async move { axum::response::Html(body) }
-            }));
-        return if slug.is_empty() {
-            router.fallback_service(spa)
+        let spa = custom_spa_router(dir, injected);
+        return Ok(if slug.is_empty() {
+            router.merge(spa)
         } else {
-            router.nest_service(&slug, spa)
-        };
+            router.nest(&slug, spa)
+        });
     }
 
     // The built-in server-rendered browser emits RELATIVE asset/link URLs
@@ -958,7 +952,7 @@ fn mount_web_router(
     );
     info!(mount, base_href, "read-only wiki browser mounted");
     if slug.is_empty() {
-        router.merge(web_router)
+        Ok(router.merge(web_router))
     } else {
         // Strip-trailing-slash redirect. The target must carry the full
         // external prefix (`{base_path}{slug}`), because the surrounding
@@ -972,7 +966,7 @@ fn mount_web_router(
                 trimmed.to_string()
             }
         };
-        router
+        Ok(router
             .route(
                 &format!("{slug}/"),
                 axum::routing::get(move || {
@@ -980,8 +974,44 @@ fn mount_web_router(
                     async move { axum::response::Redirect::permanent(&to) }
                 }),
             )
-            .nest(&slug, web_router)
+            .nest(&slug, web_router))
     }
+}
+
+fn custom_spa_router(dir: std::path::PathBuf, injected_index: String) -> axum::Router {
+    let index = Arc::new(injected_index);
+    let root_index = index.clone();
+    let direct_index = index.clone();
+    let fallback_index = index.clone();
+
+    // Assets are served as files; any missing asset path falls back to the
+    // injected index for SPA client routes. Direct `/index.html` is routed
+    // explicitly so it cannot bypass injection by being served from disk.
+    let assets = ServeDir::new(dir)
+        .append_index_html_on_directories(false)
+        .fallback(service_fn(move |_req: Request<Body>| {
+            let body = fallback_index.clone();
+            async move {
+                Ok::<_, Infallible>(axum::response::Html((*body).clone()).into_response())
+            }
+        }));
+
+    axum::Router::new()
+        .route(
+            "/",
+            axum::routing::get(move || {
+                let body = root_index.clone();
+                async move { axum::response::Html((*body).clone()) }
+            }),
+        )
+        .route(
+            "/index.html",
+            axum::routing::get(move || {
+                let body = direct_index.clone();
+                async move { axum::response::Html((*body).clone()) }
+            }),
+        )
+        .route_service("/{*path}", assets)
 }
 
 /// Response middleware: inject `<base href>` into `text/html` responses from
@@ -1168,7 +1198,8 @@ mod tests {
             "/web",
             "/web/",
             "",
-        );
+        )
+        .unwrap();
         let router = apply_http_layers(
             router,
             Arc::new(AuthState::new(Some("secret".to_string()))),
@@ -1210,7 +1241,8 @@ mod tests {
             web_slug,
             &base_href,
             &base,
-        );
+        )
+        .unwrap();
         let router = if base.is_empty() {
             router
         } else {
@@ -1347,6 +1379,167 @@ mod tests {
                 .contains(r#"<base href="/web/">"#),
             "default mount should inject the root-relative base href"
         );
+    }
+
+    #[tokio::test]
+    async fn custom_spa_index_routes_are_injected_under_base_path() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ui = TempDir::new().unwrap();
+        std::fs::write(
+            ui.path().join("index.html"),
+            "<!doctype html><html><head><title>spa</title></head><body>shell</body></html>",
+        )
+        .unwrap();
+        std::fs::write(ui.path().join("app.js"), "console.log('asset');").unwrap();
+
+        let base = normalize_prefix("/wiki");
+        let base_href = web_base_href("/wiki", "/web");
+        let router = mount_web_router(
+            axum::Router::new(),
+            true,
+            store.reader.clone(),
+            wiki,
+            Some(ui.path()),
+            &[],
+            "/web",
+            &base_href,
+            &base,
+        )
+        .unwrap();
+        let router = axum::Router::new().nest(&base, router);
+
+        for uri in [
+            "/wiki/web",
+            "/wiki/web/index.html",
+            "/wiki/web/client/route",
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let html = std::str::from_utf8(&body).unwrap();
+            assert!(
+                html.contains(r#"<base href="/wiki/web/">"#),
+                "{uri} must receive injected base href: {html}"
+            );
+            assert!(
+                html.contains(r#"<meta name="ai-memory-base-path" content="/wiki">"#),
+                "{uri} must receive injected API base-path meta: {html}"
+            );
+            assert!(html.contains("shell"), "{uri} returns the SPA shell");
+        }
+
+        let asset = router
+            .oneshot(
+                Request::builder()
+                    .uri("/wiki/web/app.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(asset.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(asset.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let js = std::str::from_utf8(&body).unwrap();
+        assert_eq!(js, "console.log('asset');");
+    }
+
+    #[tokio::test]
+    async fn custom_spa_root_slug_does_not_shadow_api_routes() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ui = TempDir::new().unwrap();
+        std::fs::write(
+            ui.path().join("index.html"),
+            "<!doctype html><html><head><title>spa</title></head><body>root shell</body></html>",
+        )
+        .unwrap();
+        std::fs::write(ui.path().join("app.js"), "console.log('root asset');").unwrap();
+
+        let base = normalize_prefix("/wiki");
+        let base_href = web_base_href("/wiki", "/");
+        let router = mount_web_router(
+            axum::Router::new(),
+            true,
+            store.reader.clone(),
+            wiki,
+            Some(ui.path()),
+            &[],
+            "/",
+            &base_href,
+            &base,
+        )
+        .unwrap();
+        let router = axum::Router::new().nest(&base, router);
+
+        for uri in ["/wiki", "/wiki/index.html", "/wiki/client/route"] {
+            let resp = router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let html = std::str::from_utf8(&body).unwrap();
+            assert!(
+                html.contains(r#"<base href="/wiki/">"#),
+                "{uri} must receive injected base href: {html}"
+            );
+            assert!(
+                html.contains(r#"<meta name="ai-memory-base-path" content="/wiki">"#),
+                "{uri} must receive injected API base-path meta: {html}"
+            );
+            assert!(html.contains("root shell"), "{uri} returns the SPA shell");
+        }
+
+        let api = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/wiki/api/v1/projects")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api.status(), StatusCode::OK);
+        let content_type = api
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            content_type.starts_with("application/json"),
+            "API route must not be shadowed by the root SPA: {content_type}"
+        );
+
+        let asset = router
+            .oneshot(
+                Request::builder()
+                    .uri("/wiki/app.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(asset.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(asset.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let js = std::str::from_utf8(&body).unwrap();
+        assert_eq!(js, "console.log('root asset');");
     }
 
     #[tokio::test]
@@ -1492,7 +1685,8 @@ mod tests {
             "/web",
             "/web/",
             "",
-        );
+        )
+        .unwrap();
         // No auth layer so we can reach /api/v1 directly.
         let resp = router
             .oneshot(
@@ -1544,7 +1738,8 @@ mod tests {
             "/web",
             "/web/",
             "",
-        );
+        )
+        .unwrap();
         let resp = router
             .oneshot(
                 Request::builder()
@@ -1585,7 +1780,8 @@ mod tests {
             "/web",
             "/web/",
             "",
-        );
+        )
+        .unwrap();
         // /web is a non-api route; sending an Origin header must not trigger CORS.
         let resp = router
             .oneshot(
