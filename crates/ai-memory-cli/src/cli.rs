@@ -949,9 +949,10 @@ pub struct WritePageArgs {
     /// Workspace name (auto-created if absent).
     #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
     pub workspace: String,
-    /// Project name within the workspace (auto-created if absent).
-    #[arg(long, default_value_t = crate::config::DEFAULT_PROJECT.to_string())]
-    pub project: String,
+    /// Project name within the workspace. When omitted, auto-detect from the
+    /// current project using the same resolver as read-page/search.
+    #[arg(long)]
+    pub project: Option<String>,
 }
 
 #[cfg(test)]
@@ -980,6 +981,41 @@ mod tests {
                 "alias {alias} must resolve to the Pi/OMP MCP client"
             );
         }
+    }
+
+    #[test]
+    fn write_page_project_is_optional_for_shared_resolution() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "write-page",
+            "--path",
+            "notes/x.md",
+            "--body",
+            "hello",
+        ])
+        .expect("write-page parses without --project");
+
+        let Command::WritePage(args) = cli.command else {
+            panic!("expected write-page command");
+        };
+        assert_eq!(args.project, None);
+
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "write-page",
+            "--path",
+            "notes/x.md",
+            "--body",
+            "hello",
+            "--project",
+            "explicit",
+        ])
+        .expect("write-page parses with --project");
+
+        let Command::WritePage(args) = cli.command else {
+            panic!("expected write-page command");
+        };
+        assert_eq!(args.project.as_deref(), Some("explicit"));
     }
 
     #[test]
