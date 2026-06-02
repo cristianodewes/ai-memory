@@ -441,8 +441,9 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 > `openai-compat`, if consolidation fails on large sessions** with
 > `did not contain a JSON object` or `serde: unknown variant`, set
 > `AI_MEMORY_LLM_COMPAT_STRICT=true`. It sends `response_format=json_schema`
-> (strict) so the engine constrains output to the schema, with a fallback to
-> the default tolerant parser when the engine ignores it. Off by default.
+> (strict) so capable engines constrain output to the schema. If the strict
+> raw call fails, ai-memory falls back to the default tolerant parser. Off by
+> default.
 
 Embeddings are optional and separate from the LLM provider. Set
 `AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`, or `gemini` when

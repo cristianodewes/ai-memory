@@ -65,9 +65,8 @@ pub struct Config {
     /// parser stays the default for older local engines that ignore
     /// `response_format`. Modern engines (recent Ollama, vLLM, LM Studio,
     /// llama.cpp) honour structured output; this lets the operator opt in.
-    /// When the strict call fails, the provider falls back to the tolerant
-    /// parser, so enabling it never regresses below the default. Set with
-    /// `AI_MEMORY_LLM_COMPAT_STRICT=true`.
+    /// If the strict raw call fails, the provider falls back to the tolerant
+    /// parser. Set with `AI_MEMORY_LLM_COMPAT_STRICT=true`.
     pub llm_compat_strict: bool,
     /// Opt-in: run LLM consolidation on SessionEnd (in addition to the
     /// always-written heuristic session page), when an LLM provider is
@@ -815,6 +814,7 @@ mod tests {
             provider.auth.require_api_key().unwrap().expose_secret(),
             "sk-test-key"
         );
+        assert!(!provider.compat_strict);
     }
 
     #[test]
@@ -852,6 +852,27 @@ mod tests {
             }
         );
         assert!(auth.optional_api_key().is_none());
+    }
+
+    #[test]
+    fn openai_compat_provider_threads_strict_flag() {
+        let cfg = Config {
+            llm_provider: Some("openai-compat".into()),
+            llm_model: Some("qwen3:32b".into()),
+            llm_base_url: Some("http://localhost:11434/v1".into()),
+            llm_compat_strict: true,
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+
+        assert_eq!(provider.provider, ProviderChoice::OpenAiCompat);
+        assert_eq!(provider.model, "qwen3:32b");
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
+        assert!(provider.compat_strict);
     }
 
     #[test]

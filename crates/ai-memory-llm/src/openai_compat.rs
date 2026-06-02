@@ -2,9 +2,10 @@
 //!
 //! Uses the same wire format as [`crate::openai::OpenAiProvider`] but
 //! with a configurable base URL (and no key required for most local
-//! deployments). Structured output falls back to "parse first JSON
-//! object out of the text" because most local engines lack reliable
-//! `response_format` honour.
+//! deployments). Structured output defaults to "parse first JSON object
+//! out of the text" because many local engines lack reliable
+//! `response_format` honour; operators can opt into strict
+//! `response_format=json_schema` for engines that support it.
 
 use std::sync::LazyLock;
 
@@ -126,10 +127,9 @@ impl LlmProvider for OpenAiCompatProvider {
         // response_format. The dialect stays Compat, so the api.openai.com
         // token/temperature quirks do NOT leak into the local engine.
         //
-        // If the strict call fails (engine that ignores the schema, truncated
-        // JSON, etc.) we fall through to the tolerant parser below instead of
-        // propagating the error — so enabling the flag never regresses below
-        // the default behaviour.
+        // If the strict raw call fails (engine that rejects the schema,
+        // truncated JSON, etc.) we fall through to the tolerant parser below
+        // instead of propagating that raw-call error.
         if self.strict {
             let mut strict_schema = schema.clone();
             enforce_strict_object_schemas(&mut strict_schema);
