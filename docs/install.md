@@ -610,6 +610,18 @@ local-data directory on Windows, typically
 To require bearer-token auth, set `AI_MEMORY_AUTH_TOKEN` in the
 server's environment.
 
+#### Optional serve flags
+
+The `serve` subcommand also accepts:
+
+| Flag | Env var | What it does |
+|---|---|---|
+| `--enable-web` | `AI_MEMORY_ENABLE_WEB=true` | Mount the read-only web browser + `/api/v1` JSON API. |
+| `--base-path /wiki` | `AI_MEMORY_BASE_PATH` | Host the entire HTTP surface (`/mcp`, `/hook`, `/admin/*`, `/api/v1`, `/web`) under a configurable subpath — useful behind a reverse proxy sharing a hostname. `.` and `..` segments are rejected; unsafe chars cause a fallback to root with a warning. See [`docs/https-via-proxy.md`](https-via-proxy.md#hosting-under-a-subpath). |
+| `--web-slug /web` | `AI_MEMORY_WEB_SLUG` | Where the web UI mounts within the base-path. Default `/web`; set to `/` to mount the UI at the base-path root. |
+| `--web-ui-dir <path>` | `AI_MEMORY_WEB_UI_DIR` | Serve a custom SPA from `<path>` instead of the built-in browser. ai-memory injects `<base href>` and `<meta name="ai-memory-base-path">` so the SPA can build relative URLs and API calls under the configured prefix. |
+| `--cors-allow-origin <origin>` | `AI_MEMORY_CORS_ALLOW_ORIGINS` (CSV) | Allow listed origins to call `/api/v1`. Layer is scoped only to that route — `/mcp`, `/hook`, `/admin`, and `/web` remain origin-locked. |
+
 On Windows, see [`docs/windows.md`](windows.md). The short version: run
 the install commands from the same environment that launches the agent.
 WSL2-launched agents need WSL paths and POSIX `.sh` hooks. Native Claude Code
@@ -806,6 +818,18 @@ required. For OpenRouter (Kimi, DeepSeek, etc.):
 -e LLM_API_KEY=sk-or-v1-...
 ```
 
+Modern Ollama, vLLM, LM Studio, llama.cpp, and gateway endpoints may honour
+OpenAI-style `response_format=json_schema`. If the tolerant default parser fails
+with errors such as `did not contain a JSON object` or `serde: unknown variant`,
+try strict compat mode:
+
+```bash
+-e AI_MEMORY_LLM_COMPAT_STRICT=true
+```
+
+Strict mode is opt-in. ai-memory sends the schema-constrained request first and
+falls back to the tolerant parser only when that raw strict call fails.
+
 ---
 
 ## Subcommand reference
@@ -891,7 +915,11 @@ remote or uses a custom host/port.
 ```
 --repo-path <PATH>         (default: git rev-parse --show-toplevel)
 --workspace <NAME>         (default: "default")
---project <NAME>           (default: "scratch")
+--project <NAME>           (default: derived from cwd — main repo root's
+                            basename via `git rev-parse --show-toplevel`,
+                            or basename(cwd) when no repo is found.
+                            "scratch" only as a defensive fallback for
+                            hook events with no usable cwd.)
 --max-input-tokens N       (default: 150000; total source budget after prune)
 --chunk-input-tokens N     (default: 24000; per LLM call; 0 = single call)
 --since "30 days ago"      (git log filter; supports "N days/months/years ago" + YYYY-MM-DD)

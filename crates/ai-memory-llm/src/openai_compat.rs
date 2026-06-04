@@ -2,9 +2,10 @@
 //!
 //! Uses the same wire format as [`crate::openai::OpenAiProvider`] but
 //! with a configurable base URL (and no key required for most local
-//! deployments). Structured output falls back to "parse first JSON
-//! object out of the text" because most local engines lack reliable
-//! `response_format` honour.
+//! deployments). Structured output defaults to "parse first JSON object
+//! out of the text" because many local engines lack reliable
+//! `response_format` honour; operators can opt into strict
+//! `response_format=json_schema` for engines that support it.
 
 use std::sync::LazyLock;
 
@@ -14,7 +15,7 @@ use secrecy::SecretString;
 use tracing::debug;
 
 use crate::error::{LlmError, LlmResult};
-use crate::openai::{OpenAiProvider, RequestDialect};
+use crate::openai::{OpenAiProvider, RequestDialect, enforce_strict_object_schemas};
 use crate::provider::LlmProvider;
 use crate::text::{suffix_within_bytes, truncate_with_ellipsis};
 use crate::types::{ChatRequest, ChatResponse};
@@ -56,6 +57,10 @@ pub(crate) fn strip_reasoning_blocks(s: &str) -> String {
 pub struct OpenAiCompatProvider {
     inner: OpenAiProvider,
     name_tag: &'static str,
+    /// When `true`, structured output sends a strict `response_format`
+    /// instead of the tolerant parser. Set by the factory from
+    /// `ProviderConfig::compat_strict` (sourced once by `Config::load`).
+    strict: bool,
 }
 
 impl OpenAiCompatProvider {
@@ -81,7 +86,17 @@ impl OpenAiCompatProvider {
         Ok(Self {
             inner,
             name_tag: "openai-compat",
+            strict: false,
         })
+    }
+
+    /// Set strict mode. The factory calls this with
+    /// `ProviderConfig::compat_strict`; `new` defaults it off so the
+    /// tolerant parser stays the zero-config behaviour.
+    #[must_use]
+    pub fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
     }
 }
 
@@ -102,11 +117,61 @@ impl LlmProvider for OpenAiCompatProvider {
     async fn complete_structured_raw(
         &self,
         request: ChatRequest,
-        _schema: serde_json::Value,
+        schema: serde_json::Value,
     ) -> LlmResult<serde_json::Value> {
-        // Most local engines don't honour `response_format`. We
-        // ask the model to emit a JSON object and fall back to
-        // extracting the first balanced `{…}` from the text.
+        // Strict mode (opt-in; see `strict` field): modern local engines
+        // honour `response_format=json_schema`. Normalise the schema
+        // to the strict subset (additionalProperties:false, full required, no
+        // oneOf / no $ref siblings) — the same rewrite the Official dialect
+        // applies — and delegate to the inner provider, which sends the
+        // response_format. The dialect stays Compat, so the api.openai.com
+        // token/temperature quirks do NOT leak into the local engine.
+        //
+        // Note: `enforce_strict_object_schemas` is invoked here because the
+        // inner provider's own normalisation is gated on `RequestDialect::
+        // Official` (see openai.rs::complete_structured_raw). The wrapper
+        // owns the Compat-side rewrite so a refactor of the inner cannot
+        // silently drop it.
+        //
+        // Fallback path:
+        // Fallback only on *parse-shape* failures — the engine returned a
+        // response but it wasn't a valid JSON object (the case the tolerant
+        // path was designed for). On `LlmError::Provider` (HTTP 4xx/5xx,
+        // auth, rate-limit) and transport-level failures, propagate the
+        // error: a `complete()` retry inside the fallback would hit the
+        // same wall and double the latency / token spend for no gain.
+        //
+        // The fallback itself is a SECOND HTTP call to the model — the
+        // strict raw call returns parsed JSON or an error, not raw text,
+        // so we can't reuse the response body. Operators on engines that
+        // routinely fall back (e.g. reasoning models with `<think>` in
+        // `content`) should keep `strict=false` to avoid the double call.
+        if self.strict {
+            let mut strict_schema = schema.clone();
+            enforce_strict_object_schemas(&mut strict_schema);
+            match self
+                .inner
+                .complete_structured_raw(request.clone(), strict_schema)
+                .await
+            {
+                Ok(v) if v.is_object() => return Ok(v),
+                Ok(_) => {
+                    debug!("compat strict: non-object response, falling back to tolerant parser");
+                }
+                Err(err) if is_parse_shape_error(&err) => {
+                    debug!(error = %err, "compat strict parse-shape mismatch, falling back to tolerant parser");
+                }
+                Err(err) => {
+                    // Transport / 5xx / auth / rate-limit: a tolerant retry
+                    // would hit the same failure. Propagate so the caller
+                    // sees the real cause and can back off appropriately.
+                    return Err(err);
+                }
+            }
+        }
+        // Default (and strict fallback): most older local engines don't
+        // honour `response_format`. Ask for JSON and extract the first
+        // balanced `{…}` object from the text.
         let res = self.inner.complete(request).await?;
         // Reasoning models (DeepSeek, Qwen, MiniMax M2.7, …) prepend
         // `<think>…</think>` before the JSON. Strip those blocks (and any
@@ -138,6 +203,14 @@ impl LlmProvider for OpenAiCompatProvider {
             }
         }
     }
+}
+
+/// True for errors where a *retry without structured-output coercion*
+/// has a real chance of succeeding — i.e. the upstream returned a
+/// response, but it wasn't in the shape we wanted. Transport / HTTP /
+/// auth errors are excluded because they would just reproduce.
+fn is_parse_shape_error(err: &LlmError) -> bool {
+    matches!(err, LlmError::UnexpectedShape(_) | LlmError::Serde(_))
 }
 
 /// Find the first balanced `{...}` object in a string, skipping
@@ -185,6 +258,47 @@ fn first_json_object(s: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `new` defaults strict off; `with_strict` is the only way to turn it
+    /// on, mirroring how the factory threads `ProviderConfig::compat_strict`.
+    #[test]
+    fn strict_defaults_off_and_can_be_overridden() {
+        let p = OpenAiCompatProvider::new("http://localhost:11434/v1", None, "mistral-nemo")
+            .expect("provider builds");
+        assert!(!p.strict);
+        let p = p.with_strict(true);
+        assert!(p.strict);
+    }
+
+    /// The strict path's fallback policy lives in `is_parse_shape_error`:
+    /// fall back ONLY when the upstream returned a response in the wrong
+    /// shape (the tolerant prose-JSON parser has a real chance). Propagate
+    /// transport / HTTP-status / auth errors — a tolerant retry would just
+    /// hit the same wall and double cost. Regression guard for the audit
+    /// finding that the original strict-fallback caught every `Err(_)`.
+    #[test]
+    fn is_parse_shape_error_classifies_correctly() {
+        // Shape failures → fall back.
+        assert!(is_parse_shape_error(&LlmError::UnexpectedShape(
+            "no JSON object".into()
+        )));
+        assert!(is_parse_shape_error(&LlmError::Serde(
+            "trailing comma".into()
+        )));
+        // Transport / HTTP / auth → propagate.
+        assert!(!is_parse_shape_error(&LlmError::Provider {
+            status: 500,
+            body: "engine boom".into()
+        }));
+        assert!(!is_parse_shape_error(&LlmError::Provider {
+            status: 401,
+            body: "unauthorized".into()
+        }));
+        assert!(!is_parse_shape_error(&LlmError::Provider {
+            status: 429,
+            body: "rate limited".into()
+        }));
+    }
 
     #[test]
     fn first_json_object_finds_balanced_object() {

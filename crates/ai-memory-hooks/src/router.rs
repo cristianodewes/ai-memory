@@ -8,7 +8,7 @@
 //! basic-memory #763). The agent never blocks on us thanks to the
 //! fire-and-forget client side.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -41,11 +41,100 @@ use crate::synth::synthesize_session_page;
 /// callers can drop or retry instead of growing memory without bound.
 pub const DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT: usize = 1024;
 
-/// Resolved-project cache: `(cwd, workspace_override, project_override, project_strategy)`
-/// keyed map, shared behind a Tokio mutex so the router can be cloned
-/// freely without losing the in-flight cache hits.
-pub type ProjectCache =
-    Arc<tokio::sync::Mutex<HashMap<(String, String, String, String), (WorkspaceId, ProjectId)>>>;
+/// Maximum cwd-resolution cache entries kept per server process. The cache is
+/// an optimization only; evicted entries are re-resolved through the writer.
+pub const DEFAULT_PROJECT_CACHE_MAX_ENTRIES: usize = 4096;
+
+/// Resolved-project cache key:
+/// `(cwd, workspace_override, project_override, project_strategy)`.
+pub type ProjectCacheKey = (String, String, String, String);
+
+/// Shared bounded resolved-project cache.
+pub type ProjectCache = Arc<tokio::sync::Mutex<ProjectCacheStore>>;
+
+/// Bounded cwd-resolution cache used by the hook router.
+#[derive(Debug)]
+pub struct ProjectCacheStore {
+    entries: HashMap<ProjectCacheKey, (WorkspaceId, ProjectId)>,
+    order: VecDeque<ProjectCacheKey>,
+    max_entries: usize,
+}
+
+impl Default for ProjectCacheStore {
+    fn default() -> Self {
+        Self::new(DEFAULT_PROJECT_CACHE_MAX_ENTRIES)
+    }
+}
+
+impl ProjectCacheStore {
+    #[must_use]
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            max_entries: max_entries.max(1),
+        }
+    }
+
+    fn get(&mut self, key: &ProjectCacheKey) -> Option<(WorkspaceId, ProjectId)> {
+        let ids = self.entries.get(key).copied()?;
+        self.touch(key);
+        Some(ids)
+    }
+
+    fn insert(&mut self, key: ProjectCacheKey, ids: (WorkspaceId, ProjectId)) {
+        if self.entries.contains_key(&key) {
+            self.entries.insert(key.clone(), ids);
+            self.touch(&key);
+            return;
+        }
+        self.entries.insert(key.clone(), ids);
+        self.order.push_back(key);
+        while self.entries.len() > self.max_entries {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &ProjectCacheKey) {
+        self.entries.remove(key);
+        self.order.retain(|k| k != key);
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    fn contains_key(&self, key: &ProjectCacheKey) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    #[cfg(test)]
+    fn values(&self) -> impl Iterator<Item = &(WorkspaceId, ProjectId)> {
+        self.entries.values()
+    }
+
+    /// Retain only cache entries that match `keep`.
+    pub fn retain<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&ProjectCacheKey, &(WorkspaceId, ProjectId)) -> bool,
+    {
+        self.entries.retain(|key, ids| keep(key, ids));
+        self.order.retain(|key| self.entries.contains_key(key));
+    }
+
+    fn touch(&mut self, key: &ProjectCacheKey) {
+        self.order.retain(|k| k != key);
+        self.order.push_back(key.clone());
+    }
+}
 
 /// Shared state passed to the hook handler.
 #[derive(Clone)]
@@ -302,13 +391,13 @@ async fn resolve_project_ids(
     );
 
     {
-        let cache = state.project_cache.lock().await;
+        let mut cache = state.project_cache.lock().await;
         if let Some(ids) = cache.get(&cache_key) {
             // Republish on every hit: a cache hit still means the agent
             // is active in this project *now*, which is exactly what the
             // MCP read tools need as their default.
             state.active_project.set(ids.0, ids.1);
-            return Ok(*ids);
+            return Ok(ids);
         }
     }
 
@@ -345,22 +434,24 @@ async fn resolve_project_ids(
         cwd: &str,
         strategy: ProjectStrategy,
     ) -> Option<(String, Option<String>)> {
+        // Delegate to the shared helper so the CLI's `resolve_project_name`
+        // and this resolver agree on what "the project for this cwd"
+        // resolves to. Map our wire-format `ProjectStrategy` onto the
+        // shared library's `ProjectNameStrategy`.
         let path = std::path::Path::new(cwd);
-        if matches!(strategy, ProjectStrategy::RepoRoot)
-            && let Ok(root) = ai_memory_consolidate::discover_main_repo_root(path)
-            && let Some(name) = basename(&root)
-        {
-            return Some((name, Some(root.to_string_lossy().into_owned())));
-        }
-        basename(path).map(|name| (name, Some(cwd.to_string())))
-    }
-
-    fn basename(path: &std::path::Path) -> Option<String> {
-        // Split on both `/` and `\` so Windows paths sent to a Linux
-        // server still resolve to the final component.
-        let s = path.to_str()?;
-        let name = s.rsplit(['/', '\\']).find(|seg| !seg.is_empty())?;
-        Some(name.to_string())
+        let strat = match strategy {
+            ProjectStrategy::Basename => ai_memory_consolidate::ProjectNameStrategy::Basename,
+            ProjectStrategy::RepoRoot => ai_memory_consolidate::ProjectNameStrategy::MainRepoRoot,
+        };
+        // When the helper returned no repo path (basename strategy or
+        // no repo found), use the original cwd as the repo_path —
+        // `get_or_create_project` records it for future cwd-based
+        // lookups even when the project lives outside a git checkout.
+        ai_memory_consolidate::derive_project_name(path, strat).map(|(name, root)| {
+            let repo_path =
+                root.map_or_else(|| cwd.to_string(), |p| p.to_string_lossy().into_owned());
+            (name, Some(repo_path))
+        })
     }
 
     let ws = state
@@ -734,7 +825,6 @@ const fn importance_for(event: HookEvent) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     use ai_memory_core::Sanitizer;
@@ -768,7 +858,7 @@ mod tests {
             wiki,
             consolidator: None,
             sanitizer,
-            project_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            project_cache: Arc::new(tokio::sync::Mutex::new(ProjectCacheStore::default())),
             active_project: ActiveProject::new(),
             consolidate_on_session_end: false,
             ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(
@@ -955,6 +1045,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn project_cache_store_evicts_oldest_untouched_entry() {
+        let mut cache = ProjectCacheStore::new(2);
+        let key_a = ("/a".into(), String::new(), String::new(), "basename".into());
+        let key_b = ("/b".into(), String::new(), String::new(), "basename".into());
+        let key_c = ("/c".into(), String::new(), String::new(), "basename".into());
+
+        cache.insert(key_a.clone(), (WorkspaceId::new(), ProjectId::new()));
+        cache.insert(key_b.clone(), (WorkspaceId::new(), ProjectId::new()));
+        assert!(
+            cache.get(&key_a).is_some(),
+            "touch key_a so key_b is oldest"
+        );
+        cache.insert(key_c.clone(), (WorkspaceId::new(), ProjectId::new()));
+
+        assert!(cache.contains_key(&key_a));
+        assert!(!cache.contains_key(&key_b));
+        assert!(cache.contains_key(&key_c));
+        assert_eq!(cache.len(), 2);
+    }
+
     /// If the cached project is deleted out from under the router (e.g.
     /// `purge-project` on a live server), the next event must self-heal:
     /// evict the stale slot, recreate the project, and ingest — instead of
@@ -1024,6 +1135,95 @@ mod tests {
         );
         let counts = state.reader.status_counts().await.unwrap();
         assert!(counts.sessions >= 1, "recreated session must be persisted");
+    }
+
+    /// The move-project hazard the (workspace_id, project_id) pairing trigger
+    /// exists for: when a cached project is MOVED to another workspace out from
+    /// under the router, the same `project_id` now belongs to a new workspace.
+    /// The next event must NOT silently write a split-brain row with the stale
+    /// workspace id — the trigger aborts that write, and the router evicts +
+    /// re-resolves into a consistent pair (exactly like the purge self-heal).
+    #[tokio::test]
+    async fn process_self_heals_when_cached_project_moved_workspaces() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = "/home/user/move-project";
+
+        // 1) First event creates + caches the project (in the default workspace).
+        let env1 = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt".into(),
+                agent: Some("claude-code".into()),
+                cwd: Some(cwd.into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "sessionID": "move-sess-1" }),
+        );
+        process(&state, env1).await.unwrap();
+        let (ws, proj) =
+            resolve_project_ids(&state, Some(cwd), None, None, ProjectStrategy::Basename)
+                .await
+                .unwrap();
+
+        // 2) Move the project to another workspace (re-stamp workspace_id, same
+        //    project_id) — the cache still points at (default_ws, proj), now a
+        //    cross-workspace stale pair.
+        let dst_ws = state
+            .writer
+            .get_or_create_workspace("archive".to_string())
+            .await
+            .unwrap();
+        state
+            .writer
+            .move_project_workspace(proj, ws, dst_ws)
+            .await
+            .unwrap();
+        assert!(
+            state
+                .project_cache
+                .lock()
+                .await
+                .values()
+                .any(|ids| *ids == (ws, proj)),
+            "cache still holds the moved project's stale (workspace, project) pair"
+        );
+
+        // 3) Next event with the same cwd must NOT create a split-brain row: the
+        //    stale (default_ws, proj) write trips the pairing trigger, the router
+        //    evicts + re-resolves, and the event lands cleanly.
+        let env2 = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt".into(),
+                agent: Some("claude-code".into()),
+                cwd: Some(cwd.into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "sessionID": "move-sess-2" }),
+        );
+        process(&state, env2)
+            .await
+            .expect("self-heal: stale cross-workspace pair must re-resolve, not write split-brain");
+
+        // 4) The moved project stayed in `dst_ws`; the cwd re-resolved to a
+        //    FRESH project back in the default workspace (never the stale pair).
+        assert_eq!(
+            state
+                .reader
+                .find_project(dst_ws, "move-project".to_string())
+                .await
+                .unwrap(),
+            Some(proj),
+            "moved project keeps its id in the destination workspace"
+        );
+        let (ws_new, proj_new) =
+            resolve_project_ids(&state, Some(cwd), None, None, ProjectStrategy::Basename)
+                .await
+                .unwrap();
+        assert_eq!(ws_new, ws, "re-resolved back into the default workspace");
+        assert_ne!(
+            proj_new, proj,
+            "a fresh project replaced the moved one for this cwd"
+        );
     }
 
     #[tokio::test]

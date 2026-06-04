@@ -10,7 +10,7 @@
 > re-explaining the architecture, the failed approaches, or the open
 > questions.
 
-[![status: v0.2 milestones complete](https://img.shields.io/badge/status-v0.2--complete-green)](docs/ARCHITECTURE.md)
+[![status: v0.8 multi-user](https://img.shields.io/badge/status-v0.8--multiuser-green)](docs/ARCHITECTURE.md)
 [![Rust](https://img.shields.io/badge/rust-1.95+-blue)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -58,11 +58,15 @@ priors are at the [bottom](#influences-and-prior-art).
   "where you left off" block before its first prompt.
 - **Per-project isolation by construction.** Each project lives at
   `<wiki_root>/<workspace_id>/<project_id>/…` keyed by stable UUIDs.
-  By default `workspace = "default"` and `project = basename($cwd)`.
-  Drop a [`.ai-memory.toml` marker file](docs/marker-file.md) in any
-  ancestor directory to override either or opt into repo-root project
-  identity — perfect for multi-client consultancies, work/personal split,
-  mono-repos, or linked git worktrees.
+  Workspace defaults to `"default"`. Project is derived from `$cwd`:
+  CLI subcommands (`bootstrap`, `write-page`, `lint`, …) walk to the
+  main git repo root so all worktrees of the same repo share one
+  project identity; the hook router defaults to `basename($cwd)` and
+  can opt into the repo-root rule. Drop a
+  [`.ai-memory.toml` marker file](docs/marker-file.md) in any
+  ancestor directory to override either field explicitly — perfect for
+  multi-client consultancies, work/personal split, mono-repos, or
+  linked git worktrees.
   Same page path can exist in two projects without collision; a
   rename is one column update; a purge is one `rm -rf`.
 - **Karpathy-style LLM wiki.** Pages are compiled from observations
@@ -79,7 +83,7 @@ priors are at the [bottom](#influences-and-prior-art).
   Server runs local (loopback) OR on a homelab box (LAN/VPN/cloud)
   with bearer-token auth.
 - **Thin-client CLI.** `ai-memory status`, `bootstrap`, `purge-project`,
-  `rename-project`, `lint`, `embed`, `forget-sweep`, `backup` are
+  `rename-project`, `move-project`, `lint`, `embed`, `forget-sweep`, `backup` are
   all HTTP clients of the running server - never touch SQLite or
   wiki files directly. `status` also reports passive LLM/embedding
   provider health from the last real provider call. Server is the
@@ -104,8 +108,11 @@ priors are at the [bottom](#influences-and-prior-art).
   on Postgres for X" or "annotate this as a project rule" and it calls
   `memory_write_page` to write a durable, git-versioned wiki page. From
   a terminal it's `ai-memory write-page --path decisions/0007-db.md
-  --title "Standardised on Postgres" --body "..." --pinned` (`--pinned`
-  exempts it from the decay sweep). Unlike a handoff (single-use) or an
+  --body $'# Standardised on Postgres\n\n...' --pinned`. `--pinned`
+  exempts it from the decay sweep; the H1 on the first line of
+  `--body` becomes the page title (omit `--title` — it's still
+  accepted, but LLM callers trip over JSON-escaping their way through
+  it, see issue #67). Unlike a handoff (single-use) or an
   auto-synthesised session page (rewritten on consolidation), a
   write-page note is yours: it shows up in `memory_query`, renders in
   `/web`, and stays until you change it.
@@ -307,10 +314,13 @@ The bearer token continues to authenticate at the wire level; users
 created via `ai-memory user add` get their own tokens that resolve to
 their identity in audit logs (and, in subsequent milestones, page
 frontmatter + the web UI). Data stays single-tenant — there is no
-RBAC. Existing single-user installs are not affected unless you opt
-in by setting `[auth].token_pepper` (auto-generated for new installs
-by `ai-memory init`). See [`docs/users.md`](docs/users.md) for the
-full walkthrough and the four-rung auth ladder.
+per-page RBAC — but once `[auth].token_pepper` enables multi-user
+mode, operational `/admin/*` endpoints such as backup, purge, move,
+embed, and commit require the root token. Existing single-user installs
+are not affected unless you opt in by setting `[auth].token_pepper`
+(auto-generated for new installs by `ai-memory init`). See
+[`docs/users.md`](docs/users.md) for the full walkthrough and the
+four-rung auth ladder.
 
 See [`docs/deploy.md`](docs/deploy.md) for the full homelab pattern
 with bearer auth, host allowlisting, and TLS/reverse-proxy options.
@@ -368,6 +378,13 @@ Useful entry points:
   A reference implementation — a SolidJS knowledge browser with
   screenshots and e2e tests — lives at
   [djalmajr/ai-memory-ui](https://github.com/djalmajr/ai-memory-ui).
+
+  When a reverse proxy hosts ai-memory under a URL subpath, set
+  `--base-path` (or `AI_MEMORY_BASE_PATH`) so every HTTP surface moves
+  together. Example: `--base-path /wiki` serves MCP at `/wiki/mcp`, hooks at
+  `/wiki/hook`, the API at `/wiki/api/v1`, and the default browser at
+  `/wiki/web`. Set `--web-slug /` if you want the browser or custom SPA at
+  `/wiki` itself.
 
 Install the routing snippet once so agents proactively call the right
 MCP tool for those prompts:
@@ -428,6 +445,15 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 > lint, explore) is summarisation, not hard reasoning, so a Haiku/mini-class
 > model is plenty and is much easier on subscription rate limits. Save the
 > high-effort thinking models for your coding agent.
+
+> [!TIP]
+> **On a local engine (Ollama, vLLM, LM Studio, llama.cpp) with
+> `openai-compat`, if consolidation fails on large sessions** with
+> `did not contain a JSON object` or `serde: unknown variant`, set
+> `AI_MEMORY_LLM_COMPAT_STRICT=true`. It sends `response_format=json_schema`
+> (strict) so capable engines constrain output to the schema. If the strict
+> raw call fails, ai-memory falls back to the default tolerant parser. Off by
+> default.
 
 Embeddings are optional and separate from the LLM provider. Set
 `AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`, or `gemini` when

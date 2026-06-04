@@ -12,7 +12,7 @@
 | | What you can do | What you can't do |
 |---|---|---|
 | `/api/v1/*` | Browse workspaces, projects, pages; read full page markdown + frontmatter + back-links; FTS5 search (global or scoped, single or multi-project); aggregate "overview" snapshots; drill into stale / duplicate / orphan pages. | Write, delete, rename, lint, consolidate, run sweeps, manage handoffs. The `/api/v1` surface is **read-only by construction** — the handlers contain zero writer calls. Writes still go through `/admin/*` (used by the CLI) or MCP tools. |
-| `--web-ui-dir` | Host any SPA at `/web`, same-origin with the API, behind the same auth. The default built-in `/web` browser stays the fallback when the flag is absent. | Host the SPA on a *different* origin without a reverse proxy — there's no CORS layer yet (see §9). |
+| `--web-ui-dir` | Host any SPA at `/web` (or `--web-slug`), same-origin with the API, behind the same auth. The default built-in `/web` browser stays the fallback when the flag is absent. | Host the SPA on a *different* origin without a reverse proxy — use same-origin hosting or configure CORS deliberately (see §9). |
 
 ## 2. Auth model
 
@@ -331,17 +331,48 @@ across all projects in the workspace:
 > Note: `last_open_handoff` is **not** consumed by the read API — the
 > handoff stays "open" and can still be accepted by the next agent.
 
+### 4.9 Cross-project graph
+
+```http
+GET /api/v1/graph
+```
+
+Returns every resolved wikilink whose endpoints sit in different
+projects, with both endpoints' workspace + project + path. Useful for
+rendering a project-level dependency view in the SPA.
+
+```json
+{
+  "edges": [
+    {
+      "from_workspace": "default",
+      "from_project":   "ai-memory",
+      "from_path":      "decisions/0014-storage.md",
+      "to_workspace":   "default",
+      "to_project":     "infra",
+      "to_path":        "runbooks/sqlite-wal.md"
+    }
+  ]
+}
+```
+
+Global today (no workspace / project filter); narrower query params
+are a follow-up.
+
 ## 5. Limits and pagination
 
 - All `limit` query params clamp to `1..=100`.
 - `POST /api/v1/search`: at most **25 scopes** per request.
 - HTTP body cap: **10 MB** (shared with the MCP body limit; you won't
   hit this for normal API traffic).
-- **No `Cache-Control` / ETag headers yet.** A polling SPA hits the DB
-  on every request. If your UI polls aggressively, consider client-side
-  debouncing; server-side caching is a planned iteration.
+- **Cache-Control + ETag.** Idempotent read endpoints (workspaces,
+  projects, pages list, page read, recent, briefing, overview) send
+  `Cache-Control: private, max-age=N` with an N tuned per endpoint
+  and a SHA-256 `ETag` derived from the response body. Browsers that
+  echo back `If-None-Match` receive a `304 Not Modified` with no body.
+  Search responses are not cacheable (request body affects the result).
 
-## 6. Custom UI hosting (`--web-ui-dir`)
+## 6. Custom UI hosting and base paths
 
 ```bash
 ai-memory serve \
@@ -364,6 +395,42 @@ The static directory is served at `/web` via `tower-http::ServeDir`:
 - **Pre-startup validation:** the directory must exist *and* contain
   `index.html`, or `ai-memory serve` exits with a clear error before
   binding. Requires `--enable-web` to also be set.
+- **Base-path injection:** ai-memory injects `<base href="...">` and
+  `<meta name="ai-memory-base-path" content="...">` into the SPA shell. This
+  covers direct `/web`, `/web/index.html`, and client-router fallback paths;
+  static assets are served unchanged.
+
+When a reverse proxy keeps ai-memory under a URL subpath, set
+`--base-path` (or `AI_MEMORY_BASE_PATH`) so every HTTP surface moves together:
+
+```bash
+ai-memory serve \
+    --transport http \
+    --bind 127.0.0.1:49374 \
+    --enable-web \
+    --base-path /wiki
+```
+
+With `--base-path /wiki`, the API lives at `/wiki/api/v1`, MCP at
+`/wiki/mcp`, hooks at `/wiki/hook`, admin routes at `/wiki/admin/*`, and the
+default web UI at `/wiki/web`. Set `--web-slug /` to mount the web UI or custom
+SPA at the base root (`/wiki`) instead of `/wiki/web`.
+
+**Base-path safety rules.** Both `--base-path` and `--web-slug` go
+through the same normaliser. Segments must be RFC 3986 unreserved
+characters (`[A-Za-z0-9-._~]`). Three things collapse the prefix to
+`""` (root mount) with a startup `WARN` so you can see the
+downgrade in the log:
+
+- `.` or `..` segments. Their characters are unreserved on their own,
+  but at the segment boundary they mean "current" and "parent" — one
+  typo and your prefix is a traversal vector.
+- Any character outside the unreserved set (spaces, `<`, `"`, etc.).
+- Empty / whitespace-only input.
+
+The trailing-slash redirect at `{base_path}{web_slug}/` →
+`{base_path}{web_slug}` keeps the query string. Fragments are
+client-side and never reach the server.
 
 When `--web-ui-dir` is **absent**, the built-in server-side `/web`
 browser is the default (read-only HTML rendering, FTS5 search,
@@ -372,8 +439,12 @@ project tree). No regression.
 ## 7. Worked example: minimal SPA fetch
 
 ```js
-// Resolve the API base from the SPA's own origin (same-origin model).
-const API = `${location.origin}/api/v1`;
+// Resolve the API base from the SPA shell injected by ai-memory. The meta tag
+// is empty at host root and e.g. "/wiki" behind a subpath reverse proxy.
+const basePath = document
+  .querySelector('meta[name="ai-memory-base-path"]')
+  ?.getAttribute("content") ?? "";
+const API = `${location.origin}${basePath}/api/v1`;
 const TOKEN = localStorage.getItem("ai-memory-token"); // your storage choice
 
 async function apiGet(path, params) {
@@ -435,15 +506,27 @@ Read these:
 | Auth + middleware layering | `crates/ai-memory-cli/src/commands/serve.rs` (`mount_web_router`, `apply_http_layers`) |
 | Custom-UI dir validation | `crates/ai-memory-cli/src/commands/serve.rs` (`validate_web_ui_args`) |
 
-## 9. Known gaps (planned iterations, not blockers)
+## 9. CORS
 
-- **`Cache-Control` + ETags** on idempotent reads. Right now every
-  `/api/v1/overview` poll hits the DB. Adding `Cache-Control: private,
-  max-age=N` + ETags is a quick win once polling patterns are observed.
-- **CORS.** No `CorsLayer` is mounted, so the API is reachable only
-  same-origin or via a reverse proxy that adds the headers. A future
-  `--cors-allow-origin` flag would let separately-hosted frontends talk
-  to a remote `ai-memory` server directly.
+`/api/v1` accepts cross-origin requests when the operator configures
+the allow-list. The CORS layer is scoped to that router only — `/mcp`,
+`/hook`, `/admin/*`, and `/web` stay same-origin.
+
+Configure via either `--cors-allow-origin <origin>` (repeatable) on
+the `serve` subcommand or `AI_MEMORY_CORS_ALLOW_ORIGINS=<csv>` in the
+environment. The list is validated at startup:
+
+- Each entry must be a fully-qualified `scheme://host[:port]` URL.
+- No trailing slash, no path, no query, no wildcard (`*`).
+- Mixed `http://` + `https://` is fine; pick what your SPA serves.
+
+Invalid origins fail startup with a clear error rather than silently
+accepting wildcard. The layer allows `GET / POST / OPTIONS`,
+`Authorization` + `Content-Type` headers, and credentials, with a
+10-minute preflight cache.
+
+## 10. Known gaps (planned iterations, not blockers)
+
 - **Write surface.** Browsers can't mutate today (notes, consolidate,
   lint, purge — all live under `/admin/*` for the CLI or under MCP
   tools for agents). A thin authenticated write surface ("edit this

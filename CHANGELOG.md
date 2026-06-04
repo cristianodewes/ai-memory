@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- New `POST /admin/delete-page` HTTP endpoint deletes a single page with
+  explicit `(workspace, project)`. Like `purge-project`/`rename-project`, it
+  uses no-create lookup — a delete on a typo'd or wrong scope now returns
+  `404 workspace 'X' not found` instead of silently auto-creating the
+  container and returning misleading `deleted: true`.
+- New `ai-memory delete-page --path <P> --workspace <W> --project <P>` CLI
+  subcommand, a thin client of `/admin/delete-page`. Mirrors the
+  write-page/read-page CLI shape so terminal users get a complete
+  delete-single-page surface for the first time.
+
+### Fixed
+- `memory_delete_page` (MCP) now accepts `workspace` alongside `project` and
+  routes scope through `effective_ids_for_read_args`, the same path the read
+  tools use. Previously a project name that lived in multiple workspaces
+  could silently route the delete to the wrong slot and return `deleted:
+  true` for a page that was never touched. Operators on shared (multi-
+  workspace) servers should explicitly pass `workspace + project` to make
+  the target unambiguous.
+
+## [0.9.0] - 2026-06-02
+### Added
+- `openai-compat` LLM providers can now opt into strict JSON Schema structured
+  output with `AI_MEMORY_LLM_COMPAT_STRICT=true`. Strict mode sends
+  `response_format=json_schema` first for compatible Ollama, vLLM, LM Studio,
+  llama.cpp, and gateway endpoints, while the tolerant JSON-object parser
+  remains the default and the fallback for strict raw-call failures ([#70]).
+- The read-only web browser now renders `[[wiki links]]` as clickable internal
+  links to the target page. Supports `[[path]]`, `[[path|label]]`,
+  `[[project:path]]`, and `[[workspace/project:path]]`, resolved against the
+  current page's project unless the target carries its own scope; bare targets
+  get a `.md` suffix. External schemes, path traversal, and links inside fenced
+  or inline code are left as literal text ([#68]).
+- `ai-memory serve --transport http` can host the entire HTTP surface under a
+  configurable subpath with `--base-path` / `AI_MEMORY_BASE_PATH`; `/mcp`,
+  `/hook`, `/admin/*`, `/api/v1`, and the web UI all move under that prefix.
+  The web UI mount can also be changed with `--web-slug`, and custom
+  `--web-ui-dir` SPAs receive injected `<base href>` plus
+  `ai-memory-base-path` metadata for same-origin API calls behind reverse
+  proxies ([#65]).
+- `ai-memory move-project` can move projects across workspaces via the admin
+  API. Fresh destinations use a lossless true move that keeps the same
+  `project_id`, sessions, observations, handoffs, embeddings, and page history;
+  existing same-named destination projects use copy-purge merge with explicit
+  `on_conflict` handling. Admission webhooks can subscribe to the new
+  `move_project` event and receive destination names in the context ([#60]).
 - Page FTS now indexes normalized page paths, so searches can find pages by
   filename or slug even when the slug does not appear in the title/body ([#62]).
 - Admission webhooks can now observe, mutate, or reject engine write/delete/
@@ -18,6 +63,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before removal ([#55]).
 
 ### Fixed
+- Backups no longer dereference symlinks under `wiki/`, preventing a planted
+  wiki symlink from pulling arbitrary readable host-file contents into
+  `backup.tar.gz`.
+- `ai-memory restore` now validates tar entries before extraction and accepts
+  only regular files/directories under the expected backup paths
+  (`wiki/`, `db/memory.sqlite`, and `config.toml`), rejecting links, special
+  files, unsafe paths, and unexpected archive entries.
+- In multi-user mode (`[auth].token_pepper` configured), operational
+  `/admin/*` endpoints now require the root token; DB-user tokens receive
+  403 while single-user installs keep the historical permissive admin behavior.
+- LLM provider clients now cap provider response bodies before JSON, text, or
+  SSE parsing, and truncate error bodies from bounded buffers instead of
+  buffering arbitrary-size responses.
+- Non-blocking admission webhooks now have a process-level in-flight cap and
+  webhook timeouts are clamped to a safe maximum, preventing observer hooks
+  from growing unbounded background work during write bursts.
+- Hook cwd/project resolution caching is now bounded with LRU-style eviction,
+  preventing unbounded process-lifetime growth from streams of unique cwd
+  values.
+- `memory_write_page` tool description and routing prompts now steer agents
+  toward writing the page title as a `# H1` on the first line of `body` and
+  omitting the `title` argument. ai-memory already auto-derived the title from
+  `# H1` (or path stem) when `title` was missing — the change is documentation
+  only, but it eliminates a known source of MCP `JSON parsing` errors when the
+  LLM failed to escape quotes/colons in `title` ([#67]).
+- Custom `--web-ui-dir` frontends no longer serve raw `/index.html` without
+  base-path injection; direct index requests and SPA fallback routes now return
+  the injected shell, while static assets remain untouched ([#65]).
+- `move-project` true moves now run through a wiki mutation gate: normal
+  page writes/reindexes validate the `(workspace_id, project_id)` pair before
+  touching disk, while true moves hold the exclusive side across the directory
+  rename and DB re-stamp. Stale old-workspace writes now fail without creating
+  orphan files, and V18 aborts if existing split-brain rows are present ([#60]).
+- `move-project` copy-purge conflict detection now treats body, frontmatter,
+  title, tier, and pinned status as the page identity under `on_conflict=block`,
+  preventing metadata-only overwrites from slipping through ([#60]).
 - `memory_write_page` calls that specify `project` without `workspace` now
   default to the active workspace published by hooks, and project-only reads use
   the same active-workspace resolution so the write can be read back without an
@@ -25,6 +106,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `memory_read_page` now accepts explicit `workspace` + `project` for sibling
   projects and falls back to the stored DB body only when the markdown file is
   missing, not when the disk source of truth is corrupt or unreadable ([#63]).
+- `openai-oauth` now speaks the current ChatGPT/Codex responses stream format
+  for bootstrap/consolidation requests and avoids sending the unsupported
+  `max_output_tokens` field on that endpoint ([#64]).
+- `ai-memory write-page` now resolves an omitted `--project` through the same
+  current-project heuristic as `read-page` and `search`, preventing writes from
+  landing in `scratch` while the read-back targets the cwd-derived project
+  ([#66]).
 
 ## [0.8.1] - 2026-05-30
 
@@ -645,7 +733,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.9.0
 [0.8.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.8.1
 [0.8.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.8.0
 [0.7.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.7.1

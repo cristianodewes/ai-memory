@@ -10,11 +10,21 @@ use tracing::debug;
 
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
-use crate::text::truncate_with_ellipsis;
+use crate::response::{provider_error_body, response_json_limited};
 use crate::types::{ChatRequest, ChatResponse, Role, Usage};
 
 /// Default OpenAI API base.
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com";
+
+/// Name embedded in the `json_schema` envelope of every structured-output
+/// request OpenAI / openai-compat send. OpenAI's docs use "Result" as the
+/// canonical sample name; we standardise on the same literal so the
+/// schema-name surface stays one source of truth across the
+/// `OpenAiProvider`, the openai-compat strict path (which delegates to
+/// this provider), the Copilot provider, and any future fork. Local
+/// engines (vLLM / LM Studio) sometimes echo this name in error
+/// messages and logs — naming it makes those messages discoverable.
+pub(crate) const STRUCTURED_OUTPUT_SCHEMA_NAME: &str = "Result";
 
 /// Build the full URL for an OpenAI-style endpoint. Tolerates the
 /// conventions found in the wild:
@@ -206,7 +216,7 @@ impl LlmProvider for OpenAiProvider {
         }
         let response_format = OpenAiResponseFormat::JsonSchema {
             json_schema: OpenAiJsonSchema {
-                name: "Result".into(),
+                name: STRUCTURED_OUTPUT_SCHEMA_NAME.into(),
                 schema,
                 strict: true,
             },
@@ -313,13 +323,13 @@ impl OpenAiProvider {
             .await?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = provider_error_body(resp).await;
             return Err(LlmError::Provider {
                 status: status.as_u16(),
-                body: truncate_with_ellipsis(&body, 1024),
+                body,
             });
         }
-        resp.json::<OpenAiResponse>().await.map_err(LlmError::from)
+        response_json_limited::<OpenAiResponse>(resp).await
     }
 }
 

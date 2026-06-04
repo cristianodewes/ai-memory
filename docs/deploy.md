@@ -117,6 +117,7 @@ deployment guide, including:
 - When to add TLS and when to skip it (the loopback + stdio cases honestly don't need it).
 - Copy-paste docker compose templates in [`docker/compose.tls.caddy.yml`](../docker/compose.tls.caddy.yml) and [`docker/compose.tls.cloudflared.yml`](../docker/compose.tls.cloudflared.yml).
 - Per-OS trust-store install for the internal-CA path (the load-bearing manual step).
+- [Hosting under a subpath](https-via-proxy.md#hosting-under-a-subpath) via `--base-path` / `AI_MEMORY_BASE_PATH` when ai-memory shares a hostname with other apps.
 - The explicit "what can go wrong" sections so you don't ship security theatre by accident.
 
 For the single-user-on-loopback Quick Start, the bearer token alone
@@ -170,12 +171,14 @@ alternatives:
 > responses with the strict-JSON consolidation prompt. If you must use one, turn
 > reasoning off.
 
-ai-memory's consolidator uses OpenAI's `json_schema` strict mode for
+ai-memory's hosted OpenAI-family providers use `json_schema` strict mode for
 structured output. The OpenAI provider normalizes schemars output into
-OpenAI's supported subset (`additionalProperties: false`, complete
-`required`, generated enum `anyOf`, and plain `$ref` nodes). Most modern
-models honour this, but if you switch to a niche local model, run a quick
-`ai-memory llm-test` (with a structured prompt) before trusting it.
+OpenAI's supported subset (`additionalProperties: false`, complete `required`,
+generated enum `anyOf`, and plain `$ref` nodes). For `openai-compat` local or
+gateway endpoints, the tolerant parser stays the default; set
+`AI_MEMORY_LLM_COMPAT_STRICT=true` only after confirming the endpoint honours
+OpenAI-style `response_format=json_schema`. If you switch to a niche local
+model, run a quick `ai-memory llm-test` before trusting it.
 
 ## Backups
 

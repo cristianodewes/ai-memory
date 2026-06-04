@@ -10,6 +10,7 @@ on a homelab box where mistakes are harder to undo.
 |---|---|---|---|---|
 | `purge-project --confirm` | ✅ yes | the one project's data | no | Atomic `rm -rf <project_root>` on the namespaced disk path; sibling projects untouched. |
 | `rename-project --from --to` | ✅ yes | no | yes (rename back) | Column-only update on `projects.name`. The on-disk dir is keyed by `project_id` (UUID), so the rename never moves a file. |
+| `move-project --confirm` | ✅ yes | source only in the merge case (a `Reject`-policy `purge_project` webhook can still abort the source teardown leaving everything intact) | no | Fresh destination → lossless **true move** (re-stamp `workspace_id`, keep `project_id`, rename the dir): sessions/observations/handoffs + history all survive. Destination with a same-named project → **copy+purge merge**: only latest pages migrate. |
 | `backup --output-path` | ✅ yes | no | n/a | Streams a gzipped tarball from the server's online `sqlite3 .backup` plus the wiki tree. Safe alongside the live writer. |
 | `restore --from <tarball>` | ❌ **stop the server first** | overwrites the data dir | no (without prior backup) | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). |
 | `reset --confirm` | ❌ **stop the server first** | yes, all data | no | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). |
@@ -118,6 +119,133 @@ Failure modes:
 - **`to` name already exists in this workspace** → 422.
 - **`to` invalid (empty, slash, whitespace)** → 422.
 - **Source `from` not found** → 404.
+
+### `move-project`
+
+```bash
+ai-memory move-project --from-workspace default --project my-project \
+  --to-workspace other-workspace --confirm
+```
+
+Moves a project into a **different** workspace. Unlike `rename-project`
+(a same-workspace column update), this crosses the workspace boundary.
+The destination decides which of two strategies runs — reported as
+`moved_via` in the response:
+
+**1. Fresh destination → `"true-move"` (lossless, the common case).**
+When the destination workspace has **no** same-named project, the move is
+a low-level re-stamp:
+
+1. Resolve the source `(from_workspace, project)`. 404 on miss.
+2. Reject `from_workspace == to_workspace` (use `rename-project`) → 422.
+3. Get-or-create the destination **workspace** row (not a new project).
+4. Take the wiki's exclusive mutation gate and run `op=move_project` admission
+   webhooks with source names in `ctx.workspace` / `ctx.project` and
+   destination names in `ctx.destination_workspace` /
+   `ctx.destination_project`. A reject-policy webhook aborts before files or DB
+   rows move.
+5. While still holding that gate, check that the destination dir is still
+   absent, then `fs::rename` the project dir
+   `<wiki>/<from_ws>/<proj>` → `<wiki>/<to_ws>/<proj>` (atomic within one
+   wiki root).
+6. Re-stamp `workspace_id` across every domain table for the project in
+   **one transaction**, keeping the same `project_id`
+   (`projects`, `pages`, `sessions`, `observations`, `handoffs`,
+   `audit_log`). `page_embeddings` and `links` are keyed by `page_id`, so
+   they follow with no re-stamp.
+
+Ordering is **rename-FIRST, SQL-commit-LAST**, so the **DB is never ahead of
+disk**: a rename failure touches nothing; a crash between the two steps leaves
+at most an orphan dir at the destination with the DB still wholly at the source
+(recoverable), never a DB row pointing at a missing file. A SQL failure renames
+the dir back, so the move is all-or-nothing unless the filesystem also refuses
+the rollback, in which case the error names the manual repair. In-process page
+writes/reindexes take the shared side of the same mutation gate and validate the
+`(workspace_id, project_id)` pair before touching disk, so stale source writes
+fail without creating orphan files after the move.
+
+This is O(1) (one transaction + one rename), re-embeds nothing, and
+**preserves everything** — sessions, observations, handoffs and the full
+supersession history all travel with the project.
+
+**Live-session guard.** The server refuses (409) to move the project the
+hook router has published as the *active* project (a live session's next
+observation would carry a now-stale `workspace_id`). Pass `--force` /
+`force: true` to override — still safe: the move republishes the active
+pointer, and the wiki pair validator plus `(workspace_id, project_id)` insert
+trigger (V18) reject stale writes cleanly, so the router re-resolves instead of
+corrupting or creating old-workspace files.
+
+**2. Destination already has a same-named project → `"copy-purge"`
+(merge).** Two distinct `project_id`s can't be re-stamped into one (it
+would collide on `UNIQUE (workspace_id, name)`), so the source's latest
+pages are copied into the existing destination project via
+`Wiki::write_page` (sanitization, link re-resolution, FTS, and — on
+deploy — the admission/git-mirror webhooks all fire), source embeddings
+are carried over verbatim, and only then is the source purged
+(`merged_into_existing: true`, `source_purged: true`).
+
+Copy-before-purge means any copy failure aborts **before** the purge,
+leaving the source intact. An unreadable source file is skipped and also
+blocks the purge (`source_purged: false`) so a fixed re-run is safe
+(re-running is idempotent — copied pages just supersede).
+
+**Same-path conflicts (`on_conflict`).** When a source page's path already
+exists in the destination with a different body, frontmatter, title, tier, or
+pinned bit, the policy decides (identical pages are always a no-op supersession
+at the same path):
+
+- **`block`** (default) — abort the whole move with 409, listing the
+  conflicting paths; the source is left intact. The safe default for a
+  destructive op: nothing is overwritten or split silently. The operator
+  resolves the conflicts or re-runs with an explicit policy.
+- **`overwrite`** — the source page supersedes the destination page at the
+  same path (the destination's prior version becomes history).
+- **`duplicate`** — keep both: the source page lands at
+  `<stem>-from-<src_workspace_slug>.md`, then `-2`, `-3`, … on
+  further collisions. The `-from-` literal is the `DEDUP_FROM_TOKEN`
+  constant in `crates/ai-memory-mcp/src/admin.rs`; if you ever
+  change one, change the other. Wikilinks pointing at the original
+  path are not rewritten, so the lossless `true-move` path remains
+  the way to preserve paths and links.
+
+Every conflict (overwrite/duplicate) is listed in the response `conflicts`
+array (`path` → `moved_to`). Set the policy via `--on-conflict` on the CLI
+or `"on_conflict": "block" | "overwrite" | "duplicate"` in the JSON body
+for direct `/admin/move-project` callers.
+
+**What does NOT migrate (merge case only):** in the `copy-purge` path the
+source's `sessions`, `observations`, and `handoffs` (the raw episodic
+capture log) are dropped by the purge, and the moved pages start a fresh
+supersession chain (the real page history lives in the wiki's git
+mirror). The `true-move` path has no such loss.
+
+> **Operational caveat — moving the project the current session writes
+> to.** Lifecycle hooks stamp an observation on every tool call into the
+> session's project. If you move that very project mid-session, the next
+> hook re-creates the source (`scratch`-style) under the old workspace.
+> Before moving a live project, point the repo's `.ai-memory.toml` at the
+> **destination** workspace first, so new hook events already land there
+> and the move is a clean no-contention operation.
+
+Failure modes:
+
+- **Missing `--confirm`** → 400.
+- **`from_workspace == to_workspace`** → 422 (use `rename-project`).
+- **Source project not found** → 404.
+- **Destination workspace directory already exists** (true-move only)
+  → 409 with `WikiError::DestinationExists` body — the destination
+  has on-disk content for the same `(workspace, project)` UUID pair
+  without a corresponding DB row; refuse and let the operator
+  reconcile manually.
+- **Block-policy same-path conflict** (copy-purge merge only) → 409
+  with `{"error": "...", "conflicts": [paths...]}` listing every
+  conflicting path. Re-run with `on_conflict=overwrite` or
+  `on_conflict=duplicate` to proceed.
+- **True-move admission or SQL re-stamp failure** → 500 and no
+  committed move. If a rare rollback double-fault happens after the
+  directory moved but before SQL committed, the error includes the
+  exact manual repair.
 
 ### `backup`
 

@@ -39,6 +39,11 @@ pub enum Command {
     ReadPage(ReadPageArgs),
     /// Write or update a wiki page atomically (also indexes it in the store).
     WritePage(WritePageArgs),
+    /// Delete a single wiki page. The server routes scope resolution
+    /// through `resolve_ws_proj`, so a delete targeting a project that
+    /// exists in multiple workspaces never silently lands in the wrong
+    /// slot (the MCP `memory_delete_page` had that gap until this build).
+    DeletePage(DeletePageArgs),
     /// Run the MCP server (with watcher) over stdio or HTTP.
     Serve(ServeArgs),
     /// Wipe the data directory's wiki/, db/, raw/ contents.
@@ -96,6 +101,13 @@ pub enum Command {
     /// Useful after renaming the project's directory on disk so the hook
     /// router keeps writing into the same logical project.
     RenameProject(RenameProjectArgs),
+    /// Move a project into another workspace. A fresh destination is a
+    /// lossless TRUE MOVE (re-stamp workspace_id, keep project_id, rename the
+    /// dir) — sessions/observations/handoffs and history all survive. A
+    /// destination that already holds a same-named project MERGES via
+    /// copy+purge (only durable pages migrate, source purged). Either way the
+    /// operation is irreversible — requires `--confirm`.
+    MoveProject(MoveProjectArgs),
     /// Remove ai-memory's wiring (hooks, MCP, instructions) from all
     /// detected agents. Dry-run unless `--apply`.
     Uninstall(UninstallArgs),
@@ -341,6 +353,38 @@ pub struct RenameProjectArgs {
     pub to: String,
 }
 
+/// Arguments for `move-project`.
+#[derive(Debug, Args)]
+pub struct MoveProjectArgs {
+    /// Source workspace. Defaults to `default`.
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub from_workspace: String,
+    /// Project name to move. When omitted, auto-derived from the basename
+    /// of the current git repo root (or CWD if no git repo).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Destination workspace. Auto-created if it doesn't exist.
+    #[arg(long)]
+    pub to_workspace: String,
+    /// REQUIRED — the move re-stamps (true-move) or copies+purges (merge) the
+    /// source, both irreversible. Without this flag the CLI errors out.
+    #[arg(long)]
+    pub confirm: bool,
+    /// Override the live-session guard. By default the server refuses (409) to
+    /// move the project a hook session is actively writing to; `--force`
+    /// proceeds anyway (still safe — the move keeps the active pointer correct
+    /// and the schema rejects any stale write).
+    #[arg(long)]
+    pub force: bool,
+    /// Merge conflict policy (copy-purge path only): what to do when a source
+    /// page's path already exists in the destination with different content.
+    /// `block` (default) aborts and lists the conflicts; `overwrite` lets the
+    /// source supersede the destination page; `duplicate` keeps both (source
+    /// lands under a de-duplicated path).
+    #[arg(long, value_parser = ["block", "overwrite", "duplicate"], default_value = "block")]
+    pub on_conflict: String,
+}
+
 /// Arguments for `install-instructions`.
 #[derive(Debug, Args)]
 pub struct InstallInstructionsArgs {
@@ -531,6 +575,23 @@ pub struct ReadPageArgs {
     /// Emit the page as JSON (includes frontmatter).
     #[arg(long)]
     pub json: bool,
+}
+
+/// Arguments for `delete-page`.
+#[derive(Debug, Args)]
+pub struct DeletePageArgs {
+    /// Exact wiki path to delete (e.g. `notes/foo.md`).
+    #[arg(long)]
+    pub path: String,
+    /// Workspace name. Defaults to `default`. Required (no auto-detect) so
+    /// a cross-workspace project-name collision can never silently route
+    /// the delete to the wrong slot.
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub workspace: String,
+    /// Project name. When omitted, auto-derived from the current project
+    /// (same heuristic write-page/read-page use).
+    #[arg(long)]
+    pub project: Option<String>,
 }
 
 /// Arguments for `reset`.
@@ -863,6 +924,23 @@ pub struct ServeArgs {
     /// --enable-web is set.
     #[arg(long)]
     pub web_ui_dir: Option<PathBuf>,
+    /// Base path the whole HTTP surface is served under. Empty (default)
+    /// keeps every route at the host root — byte-identical to previous
+    /// behaviour. Set e.g. `/wiki` to host ai-memory under a URL subpath
+    /// behind a reverse proxy that preserves the prefix; then `/mcp`,
+    /// `/api/v1`, `/hook` and the web UI all live under it (`/wiki/mcp`,
+    /// `/wiki/api/v1`, …). The value is normalised to `/<core>` (leading
+    /// slash, no trailing); `/` and `` both mean root.
+    #[arg(long, env = "AI_MEMORY_BASE_PATH", default_value = "")]
+    pub base_path: String,
+    /// Slug the web UI is mounted at, WITHIN `--base-path`. Default `/web`
+    /// (the read-only `/api/v1` API always stays at `<base>/api/v1`). Set
+    /// `/` to serve the UI at the base root itself (e.g. `/wiki` instead of
+    /// `/wiki/web`). The server injects a normalised `<base href>` into the
+    /// served HTML so the built-in UI and a custom `--web-ui-dir` SPA both
+    /// resolve their assets under the prefix without a rebuild.
+    #[arg(long, env = "AI_MEMORY_WEB_SLUG", default_value = "/web")]
+    pub web_slug: String,
     /// Run the HTTP transport in stateful (session) mode: the server
     /// issues an `Mcp-Session-Id` on `initialize` and requires it on
     /// every later request, with SSE-framed responses. Off by default —
@@ -910,9 +988,10 @@ pub struct WritePageArgs {
     /// Workspace name (auto-created if absent).
     #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
     pub workspace: String,
-    /// Project name within the workspace (auto-created if absent).
-    #[arg(long, default_value_t = crate::config::DEFAULT_PROJECT.to_string())]
-    pub project: String,
+    /// Project name within the workspace. When omitted, auto-detect from the
+    /// current project using the same resolver as read-page/search.
+    #[arg(long)]
+    pub project: Option<String>,
 }
 
 #[cfg(test)]
@@ -941,6 +1020,41 @@ mod tests {
                 "alias {alias} must resolve to the Pi/OMP MCP client"
             );
         }
+    }
+
+    #[test]
+    fn write_page_project_is_optional_for_shared_resolution() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "write-page",
+            "--path",
+            "notes/x.md",
+            "--body",
+            "hello",
+        ])
+        .expect("write-page parses without --project");
+
+        let Command::WritePage(args) = cli.command else {
+            panic!("expected write-page command");
+        };
+        assert_eq!(args.project, None);
+
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "write-page",
+            "--path",
+            "notes/x.md",
+            "--body",
+            "hello",
+            "--project",
+            "explicit",
+        ])
+        .expect("write-page parses with --project");
+
+        let Command::WritePage(args) = cli.command else {
+            panic!("expected write-page command");
+        };
+        assert_eq!(args.project.as_deref(), Some("explicit"));
     }
 
     #[test]

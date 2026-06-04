@@ -36,6 +36,8 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         bind: "127.0.0.1:0".to_string(),
         bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         token_pepper: None,
+        active_project: ai_memory_core::ActiveProject::new(),
+        on_project_moved: None,
     };
     (state, store)
 }
@@ -177,4 +179,53 @@ async fn backup_empty_store_still_succeeds() {
         .await
         .unwrap();
     assert!(!bytes.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn backup_does_not_dereference_wiki_symlinks() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _store) = make_state(&tmp).await;
+
+    let wiki_dir = tmp.path().join("wiki");
+    std::fs::create_dir_all(&wiki_dir).unwrap();
+    let secret = tmp.path().join("outside-secret.md");
+    let secret_body = "outside secret must not enter backup";
+    std::fs::write(&secret, secret_body).unwrap();
+    std::os::unix::fs::symlink(&secret, wiki_dir.join("leak.md")).unwrap();
+
+    let router = admin_router(state);
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/backup")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let decoder = GzDecoder::new(bytes.as_ref());
+    let mut archive = Archive::new(decoder);
+    for entry in archive.entries().expect("tarball must be readable") {
+        let mut entry = entry.expect("entry must be readable");
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let mut body = Vec::new();
+        entry
+            .read_to_end(&mut body)
+            .expect("regular file entry must be readable");
+        assert!(
+            !body
+                .windows(secret_body.len())
+                .any(|window| window == secret_body.as_bytes()),
+            "backup must not include symlink target contents"
+        );
+    }
 }

@@ -10,6 +10,7 @@ pub mod backup;
 pub mod bootstrap;
 pub mod commit;
 pub mod data_purge;
+pub mod delete_page;
 pub mod embed;
 pub mod forget_sweep;
 pub mod generate_auth_token;
@@ -19,6 +20,7 @@ pub mod install_instructions;
 pub mod install_mcp;
 pub mod lint;
 pub mod llm_test;
+pub mod move_project;
 pub mod openclaw_plugin;
 pub mod purge_project;
 pub mod read_page;
@@ -91,25 +93,25 @@ pub(crate) fn resolve_project_name(config: &Config, explicit: Option<&str>) -> R
         );
     }
 
-    if let Ok(root) = ai_memory_consolidate::discover_repo_root(std::path::Path::new("."))
-        && let Some(name) = root
-            .file_name()
-            .and_then(|s| s.to_str())
-            .filter(|s| !s.is_empty())
-    {
-        return Ok(name.to_string());
+    // Shared with the hook router via `derive_project_name` so the CLI
+    // and hooks agree on what "the project for this cwd" means. The
+    // `MainRepoRoot` strategy walks worktrees back to the main repo
+    // — a session in `~/repo-worktrees/feature-x/` and one in the
+    // main checkout resolve to the same project name (the main repo's
+    // basename), instead of fragmenting into separate projects.
+    // Aligned change from the earlier CLI behaviour (which used the
+    // worktree-local `discover_repo_root`).
+    if let Some((name, _)) = ai_memory_consolidate::derive_project_name(
+        &cwd,
+        ai_memory_consolidate::ProjectNameStrategy::MainRepoRoot,
+    ) {
+        return Ok(name);
     }
-    cwd.file_name()
-        .and_then(|s| s.to_str())
-        .map(str::to_string)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            anyhow!(
-                "could not derive project name from CWD ({}); \
-                 pass --project explicitly",
-                cwd.display()
-            )
-        })
+    Err(anyhow!(
+        "could not derive project name from CWD ({}); \
+         pass --project explicitly",
+        cwd.display()
+    ))
 }
 
 #[cfg(test)]

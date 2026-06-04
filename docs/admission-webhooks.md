@@ -1,10 +1,10 @@
 # Admission webhooks: pre-persistence HTTP hooks
 
 > Operator-configured HTTP hooks invoked on the engine's write path
-> (`Wiki::write_page`, `delete_page`, `purge_project`)
-> just before the page hits disk. Each hook can mutate the
-> page (return a new frontmatter / body) or just observe and side-effect
-> (return `204 No Content`). Sourced from
+> (`Wiki::write_page`, `delete_page`, `purge_project`, `move_project`)
+> just before the durable mutation commits. Write hooks can mutate the page
+> (return a new frontmatter / body); delete/purge/move hooks are notifications
+> that can observe, mirror, or reject. Sourced from
 > `crates/ai-memory-wiki/src/admission.rs` and the wiring in
 > `crates/ai-memory-cli/src/commands/serve.rs` — keep both as the
 > canonical reference if anything here drifts.
@@ -50,11 +50,26 @@ Webhooks fire on these `op` values today (extensible enum):
   `remove_dir_all`, routed from `/admin/purge-project`). Carries the
   project in `ctx`, **no** page path; fired before the directory is
   removed so a mirror can drop the project.
+- `move_project` — a whole project is moved between workspaces without
+  changing `project_id` (fresh-destination true move). Carries the source
+  project in `ctx.workspace` / `ctx.project`, destination names in
+  `ctx.destination_workspace` / `ctx.destination_project`, and no page path;
+  fired before the directory rename + DB re-stamp so a mirror can rename or
+  reject the project move.
 
-`delete` / `purge_project` are notifications — there is no body to mutate;
-a `Reject`-policy webhook still aborts the operation. Each webhook opts
-into the ops it cares about via `events`; the chain checks the op against
-`WebhookConfig::events` before dispatching.
+`delete` / `purge_project` / `move_project` are notifications — there is no
+body to mutate; a `Reject`-policy webhook still aborts the operation
+(admission fires BEFORE the SQL destruction in both the `/admin/purge-project`
+and `/admin/move-project` copy-purge paths, so reject leaves the source
+intact). Each webhook opts into the ops it cares about via `events`; the
+chain checks the op against `WebhookConfig::events` before dispatching.
+
+A copy-purge `/admin/move-project` fires **two** webhook events from
+one request: one or more `write_page` notifications as the pages copy
+into the destination, then one terminal `purge_project` notification
+when the source is torn down. The `purge_project` event carries
+`partial_failure: true` if the SQL purge committed but the on-disk
+dir removal failed afterwards.
 
 ### What does NOT fire the chain (by design)
 
@@ -79,7 +94,7 @@ into the ops it cares about via `events`; the chain checks the op against
 ```http
 POST <webhook.url>
 Content-Type: application/json
-X-Memory-Op: write_page | consolidate | delete | purge_project
+X-Memory-Op: write_page | consolidate | delete | purge_project | move_project
 ```
 
 ```jsonc
@@ -92,6 +107,8 @@ X-Memory-Op: write_page | consolidate | delete | purge_project
   "ctx": {
     "workspace": "default",                  // resolved name (see §5)
     "project": "ai-memory-ops",              // resolved name
+    "destination_workspace": "archive",       // move_project only; omitted otherwise
+    "destination_project": "ai-memory-ops",   // move_project only; omitted otherwise
     "actor": {                               // request-layer identity
       "agent": "claude-code",                // claude-code | codex | opencode | hook | cli | …
       "user": "djalmajr",                    // null when unauthenticated
@@ -99,7 +116,13 @@ X-Memory-Op: write_page | consolidate | delete | purge_project
       "client": "72836f52-...",              // DCR client UUID
       "session_id": "019e6d-..."
     },
-    "op": "write_page"                       // write_page | consolidate | delete | purge_project
+    "op": "write_page",                      // write_page | consolidate | delete | purge_project | move_project
+    "partial_failure": true                  // purge_project only, and ONLY when set
+                                             //   (skipped on the wire when false).
+                                             //   true → the DB rows were purged but
+                                             //   `remove_project_dir` failed afterwards;
+                                             //   a filesystem-tracking mirror (git push)
+                                             //   should refuse to drop its own copy.
   }
 }
 ```
@@ -198,7 +221,7 @@ name = "git-mirror"
 url  = "http://git-mirror.memory.svc.cluster.local:8080/sync"
 timeout_ms = 2000
 failure_policy = "ignore"
-events = ["write_page", "consolidate", "delete", "purge_project"]
+events = ["write_page", "consolidate", "delete", "purge_project", "move_project"]
 blocking = false                                         # fire-and-forget after the write; never blocks it
 ```
 
@@ -214,11 +237,12 @@ A webhook is either **blocking** or **non-blocking**:
   operation has completed. For writes that means the final page is on disk and
   indexed in SQLite; for deletes that means the file and index row are gone;
   for project purges that means the DB purge has completed and filesystem
-  removal has been attempted. The engine does not wait for it and ignores its
-  response, so it **cannot mutate or reject** — it only observes/mirrors the
-  final state. Use for pure backups/mirrors (e.g. `git-mirror`) so a slow or
-  down sink never adds latency to writes. Still honours `events` and the skip
-  list.
+  removal has been attempted; for project moves it means the directory and DB
+  rows now point at the destination workspace. The engine does not wait for it
+  and ignores its response, so it **cannot mutate or reject** — it only
+  observes/mirrors the final state. Use for pure backups/mirrors (e.g.
+  `git-mirror`) so a slow or down sink never adds latency to writes. Still
+  honours `events` and the skip list.
 
 Since the blocking chain is sequential, total worst-case write latency is
 `Σ timeout_ms` over the **blocking** webhooks only; non-blocking ones add none.

@@ -56,6 +56,10 @@ pub enum AdmissionOp {
     /// `remove_dir_all`). Carries the project (ctx), no page path. Lets a
     /// mirror remove the project's directory.
     PurgeProject,
+    /// A whole project is being moved between workspaces without changing its
+    /// project id. Carries source names in `workspace`/`project` and
+    /// destination names in `destination_workspace`/`destination_project`.
+    MoveProject,
 }
 
 impl AdmissionOp {
@@ -67,6 +71,7 @@ impl AdmissionOp {
             AdmissionOp::Consolidate => "consolidate",
             AdmissionOp::Delete => "delete",
             AdmissionOp::PurgeProject => "purge_project",
+            AdmissionOp::MoveProject => "move_project",
         }
     }
 }
@@ -82,6 +87,13 @@ pub enum FailurePolicy {
     /// Abort the write with an error. Use for safety-critical webhooks
     /// (e.g. a `validate-no-secrets` enforcer).
     Reject,
+}
+
+/// serde `skip_serializing_if` helper for `bool` fields that default
+/// to `false` — skip the field entirely when it carries no information
+/// so existing webhook consumers don't see an unknown extra key.
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 fn default_timeout_ms() -> u64 {
@@ -136,6 +148,12 @@ pub struct AdmissionContext {
     /// (auto-filled from `project_id` when the wiki has a store reader).
     #[serde(default)]
     pub project: String,
+    /// Destination workspace name for project-level moves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_workspace: Option<String>,
+    /// Destination project name for project-level moves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_project: Option<String>,
     /// Identity of the actor that triggered the write. The canonical
     /// multi-user [`ai_memory_core::ActorContext`] (since the v0.8 merge);
     /// `Wiki::write_page` fills it from `WritePageRequest::actor` so the
@@ -144,6 +162,16 @@ pub struct AdmissionContext {
     pub actor: ai_memory_core::ActorContext,
     /// Which lifecycle op fired the chain.
     pub op: AdmissionOp,
+    /// Set to `true` when the underlying op completed its durable DB
+    /// work but failed to complete a follow-on filesystem step (e.g.
+    /// `remove_project_dir` returned an io::Error during a purge).
+    /// The DB-side mutation is irrevocable; this flag lets mirrors that
+    /// track filesystem reality (a git-push mirror) refuse to drop their
+    /// own copy, while mirrors that track DB intent can ignore it.
+    /// Always `false` for write-page chains; only purge/move-source
+    /// callers set it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub partial_failure: bool,
     /// Names from `X-Memory-Skip-Admission-Chain` (CSV at the request layer);
     /// matched against [`WebhookConfig::name`] to short-circuit re-entrant writes.
     #[serde(default, skip_serializing)]
@@ -188,6 +216,16 @@ struct WebhookResponsePage {
 /// loop) and would be better served by an out-of-band fan-out service.
 pub const MAX_ADMISSION_WEBHOOKS: usize = 16;
 
+/// Maximum timeout a single webhook request may consume. Operators can set a
+/// lower value per hook; larger values are clamped so misconfiguration cannot
+/// pin write-path or async admission work indefinitely.
+pub const MAX_WEBHOOK_TIMEOUT_MS: u64 = 30_000;
+
+/// Maximum non-blocking webhook requests in flight for one process. Beyond this
+/// cap observer hooks are dropped with a warning; the durable wiki write has
+/// already completed, so backpressure here should never stall the caller.
+pub const MAX_ASYNC_ADMISSION_IN_FLIGHT: usize = 256;
+
 /// Maximum bytes read from a single webhook response body. Webhooks
 /// only need to return the mutated `page` envelope; multi-megabyte
 /// responses are pathological (faulty webhook or hostile peer) and
@@ -201,6 +239,7 @@ pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub struct AdmissionChain {
     webhooks: Arc<Vec<WebhookConfig>>,
     client: reqwest::Client,
+    async_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl AdmissionChain {
@@ -224,6 +263,7 @@ impl AdmissionChain {
         Ok(Self {
             webhooks: Arc::new(webhooks),
             client,
+            async_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_ASYNC_ADMISSION_IN_FLIGHT)),
         })
     }
 
@@ -277,7 +317,7 @@ impl AdmissionChain {
                 .client
                 .post(&hook.url)
                 .header("X-Memory-Op", ctx.op.as_header_value())
-                .timeout(Duration::from_millis(hook.timeout_ms))
+                .timeout(webhook_timeout(hook.timeout_ms))
                 .json(&payload)
                 .send()
                 .await;
@@ -354,11 +394,11 @@ impl AdmissionChain {
         Ok(())
     }
 
-    /// Notify webhooks of a delete / purge (`ctx.op` = `Delete` /
-    /// `PurgeProject`). Unlike [`Self::run`], there is no body to send or
-    /// mutate — the webhook acts on `ctx.op` + the (optional) page path, e.g.
-    /// a mirror `git rm`s the file or removes the project directory. Honours
-    /// the same skip-list, op-subscription, timeout, and failure policy.
+    /// Notify webhooks of a delete / purge / project move. Unlike
+    /// [`Self::run`], there is no body to send or mutate — the webhook acts on
+    /// `ctx.op` + the (optional) page path, e.g. a mirror `git rm`s the file,
+    /// removes a project directory, or renames it. Honours the same skip-list,
+    /// op-subscription, timeout, and failure policy.
     ///
     /// # Errors
     /// Returns an error only when a `Reject`-policy webhook fails.
@@ -387,7 +427,7 @@ impl AdmissionChain {
                 .client
                 .post(&hook.url)
                 .header("X-Memory-Op", ctx.op.as_header_value())
-                .timeout(Duration::from_millis(hook.timeout_ms))
+                .timeout(webhook_timeout(hook.timeout_ms))
                 .json(&payload)
                 .send()
                 .await;
@@ -443,6 +483,14 @@ impl AdmissionChain {
             if !hook.events.contains(&ctx.op) {
                 continue;
             }
+            let Ok(permit) = self.async_semaphore.clone().try_acquire_owned() else {
+                tracing::warn!(
+                    webhook = %hook.name,
+                    cap = MAX_ASYNC_ADMISSION_IN_FLIGHT,
+                    "admission async queue saturated; dropping observer webhook",
+                );
+                continue;
+            };
             let client = self.client.clone();
             let url = hook.url.clone();
             let name = hook.name.clone();
@@ -453,6 +501,7 @@ impl AdmissionChain {
             let frontmatter = frontmatter.clone();
             let body = body.to_string();
             tokio::spawn(async move {
+                let _permit = permit;
                 let payload = WebhookRequestBody {
                     page: WebhookPagePayload {
                         path: path.as_deref().unwrap_or(""),
@@ -464,7 +513,7 @@ impl AdmissionChain {
                 match client
                     .post(&url)
                     .header("X-Memory-Op", op.as_header_value())
-                    .timeout(Duration::from_millis(timeout))
+                    .timeout(webhook_timeout(timeout))
                     .json(&payload)
                     .send()
                     .await
@@ -482,6 +531,10 @@ impl AdmissionChain {
             });
         }
     }
+}
+
+fn webhook_timeout(timeout_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms.clamp(1, MAX_WEBHOOK_TIMEOUT_MS))
 }
 
 async fn read_response_limited(resp: reqwest::Response) -> Result<Option<Vec<u8>>, reqwest::Error> {
@@ -518,6 +571,52 @@ mod tests {
     }
 
     #[test]
+    fn webhook_timeout_is_clamped_to_smart_bounds() {
+        assert_eq!(webhook_timeout(0), Duration::from_millis(1));
+        assert_eq!(webhook_timeout(2_000), Duration::from_millis(2_000));
+        assert_eq!(
+            webhook_timeout(MAX_WEBHOOK_TIMEOUT_MS + 1),
+            Duration::from_millis(MAX_WEBHOOK_TIMEOUT_MS)
+        );
+    }
+
+    /// `partial_failure` serialises only when `true`, so existing webhook
+    /// consumers see no extra key on the happy path. Mirrors that care
+    /// about filesystem-vs-DB drift (a git-push mirror) opt in by reading
+    /// the field when it appears.
+    #[test]
+    fn partial_failure_is_omitted_when_false() {
+        let ctx = AdmissionContext {
+            workspace: "w".into(),
+            project: "p".into(),
+            op: AdmissionOp::PurgeProject,
+            ..Default::default()
+        };
+        let payload = serde_json::to_value(&ctx).unwrap();
+        assert!(
+            payload.get("partial_failure").is_none(),
+            "partial_failure must be skipped when false: {payload}"
+        );
+    }
+
+    #[test]
+    fn partial_failure_serialises_when_true() {
+        let ctx = AdmissionContext {
+            workspace: "w".into(),
+            project: "p".into(),
+            op: AdmissionOp::PurgeProject,
+            partial_failure: true,
+            ..Default::default()
+        };
+        let payload = serde_json::to_value(&ctx).unwrap();
+        assert_eq!(
+            payload.get("partial_failure").and_then(|v| v.as_bool()),
+            Some(true),
+            "partial_failure must appear on the wire when true: {payload}"
+        );
+    }
+
+    #[test]
     fn webhook_config_deserialises_with_defaults() {
         // Using JSON keeps the test free of an extra TOML dep — the
         // serde derives are format-agnostic so the same `#[serde(default)]`
@@ -538,6 +637,7 @@ mod tests {
     fn op_header_values() {
         assert_eq!(AdmissionOp::WritePage.as_header_value(), "write_page");
         assert_eq!(AdmissionOp::Consolidate.as_header_value(), "consolidate");
+        assert_eq!(AdmissionOp::MoveProject.as_header_value(), "move_project");
     }
 
     #[tokio::test]

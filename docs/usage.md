@@ -49,6 +49,7 @@ the wiki without you naming tools explicitly.
 | "Save context for the next session" | `memory_handoff_begin` | Writes a terse handoff with open questions and next steps. |
 | "Consolidate this session" | `memory_consolidate` | Manually runs LLM consolidation. Also runs on PreCompact, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set (off by default; session end otherwise writes a rule-based summary page). |
 | "Remember this permanently" / "add an annotation" | `memory_write_page` | Writes durable wiki knowledge; not a single-use handoff. |
+| "Delete this page" / "remove the note about X" | `memory_delete_page` | Removes a page by exact path. Pass `workspace` + `project` together when the page lives in a sibling workspace, so a project name shared between workspaces never silently routes the delete to the wrong slot. |
 | "Audit the wiki" / "any contradictions?" | `memory_lint` | Runs stale-page, contradiction, and rule-suggestion checks. |
 | "How big is the wiki?" / "stats?" | `memory_status`, `memory_briefing` | Counts and recent activity windows. |
 
@@ -136,10 +137,26 @@ command: ["serve", "--transport", "http", "--bind", "0.0.0.0:49374", "--enable-w
 ```
 
 The web UI is read-only: project list, per-project page tree,
-breadcrumbs, rendered markdown, metadata, and FTS5 search. If the
-server has `AI_MEMORY_AUTH_TOKEN` set, the browser uses HTTP Basic auth:
-leave the username blank and paste the token as the password. MCP and
-hook clients continue to use `Authorization: Bearer <token>`.
+breadcrumbs, rendered markdown, metadata, and FTS5 search. In rendered
+pages, `[[wiki links]]` become clickable links to the target page —
+`[[path]]`, `[[path|label]]`, `[[project:path]]`, and
+`[[workspace/project:path]]` are all supported (resolved against the
+current page's project unless the target carries its own scope).
+`[[…]]` stays literal inside fenced code (` ``` ` and `~~~` close
+only by their own glyph), inline `` `…` `` code, and 4-space-indented
+code; external schemes inside the brackets (`http://`, `https://`,
+`mailto:`, `data:`, `javascript:`, `vbscript:`, `tel:`, `file:`)
+stay literal too. If the server has `AI_MEMORY_AUTH_TOKEN` set, the
+browser uses HTTP Basic auth: leave the username blank and paste the
+token as the password. MCP and hook clients continue to use
+`Authorization: Bearer <token>`.
+
+To host the web UI under a URL subpath behind a reverse proxy, the
+`--base-path` / `--web-slug` flags do the work — see
+[`docs/frontend-api.md`](frontend-api.md#6-custom-ui-hosting-and-base-paths)
+for the flag semantics and
+[`docs/https-via-proxy.md`](https-via-proxy.md#hosting-under-a-subpath)
+for the proxy-side walk-through.
 
 ![Project list homepage with four projects shown as cards with page counts and last activity.](web-projects-home.png)
 

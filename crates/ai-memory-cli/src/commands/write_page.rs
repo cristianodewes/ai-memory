@@ -50,10 +50,10 @@ pub async fn run(config: &Config, args: WritePageArgs) -> Result<()> {
         args.body
     };
 
-    // `project` has a non-empty default ("scratch"); pass it directly so the
-    // explicit --project flag always wins. The auto-detect path is only useful
-    // for commands whose project arg is truly optional (no default).
-    let project = args.project.clone();
+    // Resolve the project the same way read-page/search do: explicit flag wins,
+    // otherwise derive the current project from host cwd / repo root. This keeps
+    // write + read-back pairs from silently targeting different projects.
+    let project = super::resolve_project_name(config, args.project.as_deref())?;
 
     let endpoint = ServerEndpoint::from_config(config);
     let resp: WritePageResponseBody = post_json(

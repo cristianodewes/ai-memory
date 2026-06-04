@@ -13,6 +13,8 @@
 //! - `POST /admin/commit`         — stage + commit the wiki tree via git.
 //! - `POST /admin/purge-project`  — delete a project and all its data.
 //! - `POST /admin/rename-project` — rename a project (column-only; no files move).
+//! - `POST /admin/move-project`   — move a project into another workspace
+//!   (copy latest pages via the write path, then purge the source).
 //! - `POST /admin/write-page`     — write or update a wiki page atomically.
 //! - `GET  /admin/read-page`      — fetch the full body of a single wiki page by path.
 //!
@@ -30,18 +32,20 @@ use ai_memory_consolidate::{
     prune_sources_to_budget, run_lint, run_sweep,
 };
 use ai_memory_core::{
-    DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
+    ActiveProject, DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME, PagePath, ProjectId, SessionId,
+    Tier, WorkspaceId,
 };
 use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapshot};
 use ai_memory_store::{
     DecayParams, EmbeddingWrite, ReaderPool, StoreError, WriterHandle, f32_vec_to_bytes,
 };
-use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WikiError, WritePageRequest};
+use ai_memory_wiki::{AdmissionContext, AdmissionOp, Markdown, Wiki, WikiError, WritePageRequest};
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use flate2::Compression;
@@ -91,6 +95,20 @@ pub struct AdminState {
     /// installs that predate v0.8); user-management endpoints then
     /// return 503 `multi-user not enabled`.
     pub token_pepper: Option<ai_memory_store::TokenPepper>,
+    /// Shared in-process pointer to the project the agent is currently
+    /// active in (published by the hook router). Read by `move-project` to
+    /// refuse moving the live project (unless `force`) and to keep the
+    /// pointer correct after a move. Empty `ActiveProject::new()` when no
+    /// hook router is attached (admin-only tests).
+    pub active_project: ActiveProject,
+    /// Optional hook to PROACTIVELY evict the hook router's per-cwd
+    /// `(workspace_id, project_id)` cache for a project that just moved
+    /// workspaces. Called with the moved `project_id` after a successful move
+    /// so the next hook event re-resolves cleanly instead of tripping the
+    /// pairing trigger on a stale cached pair first. Fire-and-forget
+    /// (best-effort); the trigger + router re-resolve are the correctness net.
+    /// `None` when no hook router is attached (stdio / admin-only tests).
+    pub on_project_moved: Option<std::sync::Arc<dyn Fn(ProjectId) + Send + Sync>>,
 }
 
 /// JSON request body for `POST /admin/bootstrap`.
@@ -140,9 +158,11 @@ fn default_chunk_input_tokens() -> usize {
 /// - `POST /admin/commit`
 /// - `POST /admin/purge-project`
 /// - `POST /admin/rename-project`
+/// - `POST /admin/move-project`
 /// - `POST /admin/write-page`
 pub fn admin_router(state: AdminState) -> Router {
-    Router::new()
+    let state = Arc::new(state);
+    let operational = Router::new()
         .route("/admin/backup", post(handle_backup))
         .route("/admin/bootstrap", post(handle_bootstrap))
         .route("/admin/status", get(handle_status))
@@ -155,7 +175,14 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/admin/commit", post(handle_commit))
         .route("/admin/purge-project", post(handle_purge_project))
         .route("/admin/rename-project", post(handle_rename_project))
+        .route("/admin/move-project", post(handle_move_project))
         .route("/admin/write-page", post(handle_write_page))
+        .route("/admin/delete-page", post(handle_delete_page))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_root_for_multiuser_admin,
+        ));
+    let users = Router::new()
         .route(
             "/admin/users",
             get(handle_list_users).post(handle_create_user),
@@ -165,8 +192,38 @@ pub fn admin_router(state: AdminState) -> Router {
         .route(
             "/admin/users/{username}/rotate-token",
             post(handle_rotate_user_token),
-        )
-        .with_state(Arc::new(state))
+        );
+    operational.merge(users).with_state(state)
+}
+
+async fn require_root_for_multiuser_admin(
+    State(state): State<Arc<AdminState>>,
+    req: axum::http::Request<Body>,
+    next: Next,
+) -> Response {
+    if state.token_pepper.is_none() {
+        return next.run(req).await;
+    }
+    let level = req
+        .extensions()
+        .get::<ai_memory_core::AuthLevel>()
+        .copied()
+        .unwrap_or(ai_memory_core::AuthLevel::Anonymous);
+    if level.is_root() {
+        return next.run(req).await;
+    }
+    let (code, msg) = match level {
+        ai_memory_core::AuthLevel::Anonymous => (
+            StatusCode::UNAUTHORIZED,
+            "admin operation requires authentication in multi-user mode",
+        ),
+        ai_memory_core::AuthLevel::User => (
+            StatusCode::FORBIDDEN,
+            "admin operation is root-only in multi-user mode",
+        ),
+        ai_memory_core::AuthLevel::Root => unreachable!("guarded above"),
+    };
+    (code, Json(serde_json::json!({ "error": msg }))).into_response()
 }
 
 // ---------------------------------------------------------------------
@@ -228,6 +285,7 @@ async fn build_backup_tarball_file(state: &AdminState) -> anyhow::Result<tokio::
         let encoder = GzEncoder::new(&mut tar_file, Compression::default());
         let mut tar = tar::Builder::new(encoder);
         tar.mode(tar::HeaderMode::Deterministic);
+        tar.follow_symlinks(false);
 
         let wiki_dir = state.data_dir.join("wiki");
         if wiki_dir.is_dir() {
@@ -1464,9 +1522,19 @@ async fn handle_purge_project(
             files_failed.push(proj_root_str);
         }
     }
-    state
-        .wiki
-        .dispatch_purge_project(resolved_purge_ctx.as_ref());
+    // Mirrors that track filesystem reality (a git-push mirror) want to
+    // know the on-disk dir is still present even though the DB rows are
+    // gone, so they can refuse to drop their own copy in violation of
+    // their source of truth. Mirrors that track DB intent can ignore
+    // `partial_failure`. Default-skipped on the wire so existing
+    // webhook consumers see no extra key.
+    let mut dispatch_ctx = resolved_purge_ctx;
+    if !files_failed.is_empty()
+        && let Some(ref mut c) = dispatch_ctx
+    {
+        c.partial_failure = true;
+    }
+    state.wiki.dispatch_purge_project(dispatch_ctx.as_ref());
 
     let report = PurgeProjectReport {
         label: summary.label,
@@ -1575,6 +1643,800 @@ async fn handle_rename_project(
     (
         StatusCode::OK,
         Json(serde_json::to_value(&summary).unwrap_or_else(|_| serde_json::json!({}))),
+    )
+}
+
+// ---------------------------------------------------------------------
+// move-project
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/move-project`.
+#[derive(Deserialize)]
+struct MoveProjectRequest {
+    /// Source workspace. Must already exist; we 404 if absent.
+    from_workspace: String,
+    /// Project name to move. Must already exist in `from_workspace`; 404 if absent.
+    project: String,
+    /// Destination workspace. Auto-created if absent.
+    to_workspace: String,
+    /// Mandatory confirmation flag. The move PURGES the source after
+    /// copying, so without `confirm: true` the server returns 400.
+    confirm: bool,
+    /// Override the live-session guard. By default the server refuses (409)
+    /// to move the project the hook router is currently writing to, since a
+    /// live session's next observation would carry a stale workspace id.
+    /// `force: true` proceeds anyway (still safe: the move republishes the
+    /// active pointer and the (workspace_id, project_id) trigger makes any
+    /// stale write fail cleanly rather than corrupt).
+    #[serde(default)]
+    force: bool,
+    /// Policy for the copy-purge MERGE path when a source page's path already
+    /// exists in the destination with DIFFERENT content. Ignored by true-move
+    /// (no copy). Default `block` — the safe choice for a destructive op.
+    #[serde(default)]
+    on_conflict: OnConflict,
+}
+
+/// What to do when a merged page path collides with an existing destination
+/// page of different content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+enum OnConflict {
+    /// Abort the whole move (source untouched), listing the conflicting paths.
+    /// The operator resolves them or picks another policy explicitly.
+    #[default]
+    Block,
+    /// The source page supersedes the destination page at the same path (the
+    /// destination's prior version becomes history).
+    Overwrite,
+    /// Keep BOTH: the source page lands under a de-duplicated path
+    /// (`<stem>-from-<src_workspace>.md`), reported in `conflicts`.
+    Duplicate,
+}
+
+/// Wire-format report returned by `POST /admin/move-project`.
+#[derive(Debug, Serialize)]
+pub struct MoveProjectReport {
+    /// `from_workspace/project` label.
+    pub from: String,
+    /// `to_workspace/project` label.
+    pub to: String,
+    /// `true` when the destination workspace already held a same-named
+    /// project — the copy MERGED into it rather than creating a fresh one.
+    pub merged_into_existing: bool,
+    /// How the move was performed:
+    /// - `"true-move"`: a lossless cross-workspace re-stamp (same `project_id`,
+    ///   one SQL transaction + one dir rename). Used when the destination has
+    ///   no same-named project. Sessions/observations/handoffs and the full
+    ///   supersession history all survive; nothing is re-embedded.
+    /// - `"copy-purge"`: the destination already held a same-named project, so
+    ///   the source's latest pages were copied in and merged, then the source
+    ///   purged. Only durable pages move; episodic rows are dropped.
+    pub moved_via: &'static str,
+    /// Number of latest pages copied into the destination (copy-purge) or
+    /// re-stamped in place (true-move).
+    pub pages_copied: u64,
+    /// Source paths whose on-disk file could not be read (copy skipped).
+    /// When non-empty the source is NOT purged so a fixed re-run is safe.
+    pub pages_skipped: Vec<String>,
+    /// Whether the source project was purged (only when every page copied).
+    pub source_purged: bool,
+    /// Source `pages` rows deleted by the purge (all versions).
+    pub source_pages_deleted: u64,
+    /// Source `sessions` rows deleted by the purge.
+    pub source_sessions_deleted: u64,
+    /// Source `observations` rows deleted by the purge.
+    pub source_observations_deleted: u64,
+    /// Source `handoffs` rows deleted by the purge.
+    pub source_handoffs_deleted: u64,
+    /// Source `page_embeddings` rows deleted by the purge.
+    pub source_embeddings_deleted: u64,
+    /// Source on-disk dirs removed.
+    pub files_deleted: Vec<String>,
+    /// Source on-disk dirs that could not be removed (non-fatal).
+    pub files_failed: Vec<String>,
+    /// Same-path conflicts in the copy-purge merge: a source page whose path
+    /// already existed in the destination (with different content) was landed
+    /// under a de-duplicated path so BOTH survive. Each entry is the original
+    /// source path and the de-duplicated destination path it was written to.
+    pub conflicts: Vec<PathConflict>,
+}
+
+/// One same-path collision resolved by de-duplicating the source page's path.
+#[derive(Debug, Serialize)]
+pub struct PathConflict {
+    /// The source page's original path (also the destination's existing path).
+    pub path: String,
+    /// The de-duplicated path the source page was written to instead.
+    pub moved_to: String,
+}
+
+/// Lossless cross-workspace move: under the wiki mutation gate, rename the
+/// project's on-disk dir to the destination workspace, then re-stamp its
+/// `workspace_id` across every domain table (one transaction, same
+/// `project_id`). The caller has already verified the destination has no
+/// same-named project.
+async fn true_move_project(
+    state: &Arc<AdminState>,
+    req: &MoveProjectRequest,
+    src_ws: WorkspaceId,
+    src_proj: ProjectId,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Ensure the destination workspace ROW exists (FK target for the
+    // re-stamp) without creating a new project — the existing project_id is
+    // what we move.
+    let dst_ws = match state
+        .writer
+        .get_or_create_workspace(req.to_workspace.clone())
+        .await
+    {
+        Ok(ws) => ws,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    // A true move targets a FRESH destination, so its dir must not already
+    // exist. Wiki::move_project_workspace repeats this check under the
+    // exclusive mutation guard before it renames anything.
+    let dst_dir = state.wiki.project_root(dst_ws, src_proj);
+    if dst_dir.exists() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "destination dir already exists: {}; refusing true-move",
+                    dst_dir.display()
+                )
+            })),
+        );
+    }
+
+    let move_ctx = AdmissionContext {
+        workspace: req.from_workspace.clone(),
+        project: req.project.clone(),
+        destination_workspace: Some(req.to_workspace.clone()),
+        destination_project: Some(req.project.clone()),
+        op: AdmissionOp::MoveProject,
+        ..Default::default()
+    };
+
+    // Wiki owns the critical section: it runs move admission, renames the dir,
+    // re-stamps SQLite, and rolls the dir back on SQL failure while normal page
+    // writes/reindexes are blocked by the same process-local gate.
+    let summary = match state
+        .wiki
+        .move_project_workspace(src_proj, src_ws, dst_ws, Some(move_ctx))
+        .await
+    {
+        Ok(s) => s,
+        Err(WikiError::Store(StoreError::NotFound(msg))) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": msg })),
+            );
+        }
+        Err(e @ WikiError::DestinationExists(_)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, "true-move: move aborted before completion");
+            return internal_err(format!("move aborted (nothing changed): {e}"));
+        }
+    };
+
+    // Keep the in-process active-project pointer correct: the project_id is
+    // unchanged, only its workspace moved. If a hook had published this project
+    // as active, republish it under the destination workspace so the next event
+    // resolves cleanly (rather than tripping the pairing trigger first).
+    if state.active_project.get().map(|(_, p)| p) == Some(src_proj) {
+        state.active_project.set(dst_ws, src_proj);
+    }
+    // Proactively drop any stale per-cwd cache entry for the moved project.
+    if let Some(evict) = &state.on_project_moved {
+        evict(src_proj);
+    }
+
+    let report = MoveProjectReport {
+        from: format!("{}/{}", req.from_workspace, req.project),
+        to: format!("{}/{}", req.to_workspace, req.project),
+        merged_into_existing: false,
+        moved_via: "true-move",
+        pages_copied: summary.pages_moved,
+        pages_skipped: Vec::new(),
+        // Nothing is purged in a true move — the source rows ARE the
+        // destination rows, just re-stamped.
+        source_purged: false,
+        source_pages_deleted: 0,
+        source_sessions_deleted: 0,
+        source_observations_deleted: 0,
+        source_handoffs_deleted: 0,
+        source_embeddings_deleted: 0,
+        files_deleted: Vec::new(),
+        files_failed: Vec::new(),
+        // A true move never copies pages, so it never has a path conflict.
+        conflicts: Vec::new(),
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+    )
+}
+
+/// Token inserted between the original stem and the source-workspace
+/// slug when copy-purge merges conflicting page paths
+/// (`<stem>-from-<src_workspace>.md`). The literal also appears in
+/// `docs/lifecycle-ops.md`; keep these two in sync.
+const DEDUP_FROM_TOKEN: &str = "-from-";
+
+/// Char allowlist for the source-workspace slug embedded in a deduped
+/// destination path. ASCII alphanumeric plus `-` / `_` keeps the slug
+/// safe inside a filesystem path component on every supported platform
+/// (Windows treats `:`, `*`, `?`, `<`, `>`, `|` as illegal; Linux
+/// tolerates more but UTF-8 mojibake in filenames is a maintenance
+/// hazard). Everything else collapses to a single `-` separator,
+/// preserving readability without introducing path-traversal vectors.
+fn is_dedup_slug_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+}
+
+/// Pick a destination path that collides with neither an existing destination
+/// page nor one already claimed in this run. Keeps the source page's stem and
+/// appends `<DEDUP_FROM_TOKEN><src_workspace>` (then `-2`, `-3`, …). Used by
+/// the copy-purge merge to keep BOTH pages when a path conflicts.
+async fn dedup_dest_path(
+    state: &AdminState,
+    dst_ws: WorkspaceId,
+    dst_proj: ProjectId,
+    src_path: &str,
+    src_workspace: &str,
+    used: &std::collections::HashSet<String>,
+) -> PagePath {
+    let (stem, ext) = match src_path.rsplit_once('.') {
+        Some((s, e)) => (s.to_string(), format!(".{e}")),
+        None => (src_path.to_string(), String::new()),
+    };
+    let slug: String = src_workspace
+        .chars()
+        .map(|c| if is_dedup_slug_char(c) { c } else { '-' })
+        .collect();
+    let base = format!("{stem}{DEDUP_FROM_TOKEN}{slug}");
+    let mut n = 0u32;
+    loop {
+        let cand = if n == 0 {
+            format!("{base}{ext}")
+        } else {
+            format!("{base}-{n}{ext}")
+        };
+        let collides = used.contains(&cand)
+            || matches!(
+                state.reader.page_body_by_ids(dst_ws, dst_proj, &cand).await,
+                Ok(Some(_))
+            );
+        if !collides && let Ok(p) = PagePath::new(cand) {
+            return p;
+        }
+        n += 1;
+    }
+}
+
+fn page_copy_differs(
+    existing: &ai_memory_store::StoredPageBody,
+    source: &Markdown,
+    source_title: &str,
+    source_tier: Tier,
+    source_pinned: bool,
+) -> bool {
+    let source_frontmatter = match serde_json::to_string(&source.frontmatter) {
+        Ok(value) => value,
+        Err(_) => return true,
+    };
+    existing.body != source.body
+        || existing.frontmatter_json != source_frontmatter
+        || existing.title != source_title
+        || existing.tier != source_tier.as_str()
+        || existing.pinned != source_pinned
+}
+
+async fn handle_move_project(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<MoveProjectRequest>,
+) -> impl IntoResponse {
+    // Destructive: it purges the source after copying. Require confirm.
+    if !req.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "destructive operation requires confirm=true"
+            })),
+        );
+    }
+
+    // A same-workspace "move" would get-or-create the SAME project as both
+    // source and destination, copy it onto itself, then purge it — data
+    // loss. Reject; in-workspace renames go through rename-project.
+    if req.from_workspace == req.to_workspace {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "from_workspace and to_workspace are identical; use rename-project instead"
+            })),
+        );
+    }
+
+    // Resolve the SOURCE without auto-creating — 404 on a typo.
+    let (src_ws, src_proj) =
+        match lookup_ws_proj_no_create(&state, &req.from_workspace, &req.project).await {
+            Ok(ids) => ids,
+            Err(e) => return e,
+        };
+
+    // Live-session guard: refuse to move the project the hook router is
+    // currently writing to. A live session's next observation/log would carry
+    // the now-stale workspace id (the (workspace_id, project_id) trigger would
+    // make it fail, but the operator should consciously opt in). `force: true`
+    // proceeds — safe because the move republishes the active pointer below.
+    if !req.force && state.active_project.get().map(|(_, p)| p) == Some(src_proj) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "{}/{} is the active session's project; a live move risks stale-cache writes. \
+                     Re-run with force=true to proceed.",
+                    req.from_workspace, req.project
+                )
+            })),
+        );
+    }
+
+    // Detect MERGE: does the destination workspace already hold a same-named
+    // project? (find_workspace may be None when the dest ws doesn't exist yet.)
+    let merged_into_existing = match state.reader.find_workspace(req.to_workspace.clone()).await {
+        Ok(Some(dst_ws)) => matches!(
+            state.reader.find_project(dst_ws, req.project.clone()).await,
+            Ok(Some(_))
+        ),
+        Ok(None) => false,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    // FRESH destination (no same-named project there) → lossless TRUE MOVE.
+    // Re-stamp the source project's workspace_id across every domain table in
+    // one transaction (same project_id), then rename its on-disk dir. This
+    // keeps sessions/observations/handoffs and the full supersession history,
+    // and is O(1) instead of O(pages) — no per-page re-write, re-embed, or
+    // admission webhook. The copy+purge path below is reserved for the MERGE
+    // case, where two project_ids can't be re-stamped into one
+    // (UNIQUE(workspace_id, name) collision).
+    if !merged_into_existing {
+        return true_move_project(&state, &req, src_ws, src_proj).await;
+    }
+
+    // MERGE: the destination already holds a same-named project. Get-or-create
+    // it (auto-creating the destination workspace) and copy the source's
+    // latest pages into it, then purge the source.
+    let (dst_ws, dst_proj) = match resolve_ws_proj(&state, &req.to_workspace, &req.project).await {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+
+    copy_purge_merge(&state, &req, src_ws, src_proj, dst_ws, dst_proj).await
+}
+
+/// One source page, with everything the copy loop and the block
+/// pre-check both need. Built in ONE pass over the source listing so
+/// the previous two-pass implementation's double-IO (pre-scan + copy
+/// loop each calling `page_meta` + `page_body_by_ids` + `read_page`)
+/// collapses to a single read per page.
+struct PreparedSourcePage {
+    path: PagePath,
+    /// Path as a String — only needed for reports / `pages_skipped`
+    /// and `dedup` lookups; kept here so we don't keep recomputing.
+    path_str: String,
+    title: String,
+    tier: Tier,
+    pinned: bool,
+    /// `Some(md)` when the on-disk source survived parsing; `None` when
+    /// reading or parsing failed and the page must be skipped (the
+    /// safety guard at the end of the merge will refuse to purge).
+    md: Option<Markdown>,
+    /// `true` when the destination already holds this path with a
+    /// DIFFERENT page (body / frontmatter / title / tier / pinned).
+    /// `false` when there's no destination row, the destination
+    /// matches verbatim (no-op supersession), or the source itself
+    /// couldn't be parsed and we'd skip it anyway.
+    dest_conflict: bool,
+}
+
+/// Load every source page (metadata + body) and pre-classify whether
+/// its path collides with a different page at the destination. Both
+/// the `Block` pre-check and the copy loop drive off the returned
+/// vector, so each page is read at most once.
+async fn prepare_source_pages(
+    state: &AdminState,
+    req: &MoveProjectRequest,
+    src_ws: WorkspaceId,
+    src_proj: ProjectId,
+    dst_ws: WorkspaceId,
+    dst_proj: ProjectId,
+    summaries: &[ai_memory_store::PageSummary],
+) -> Vec<PreparedSourcePage> {
+    let mut out = Vec::with_capacity(summaries.len());
+    for s in summaries {
+        let Ok(path) = PagePath::new(s.path.clone()) else {
+            // Unparseable path — record a "skip" entry so the copy
+            // loop can report it without re-trying the lookup.
+            out.push(PreparedSourcePage {
+                path: PagePath::new("invalid.md".to_string()).expect("valid placeholder"),
+                path_str: s.path.clone(),
+                title: s.title.clone(),
+                tier: Tier::Semantic,
+                pinned: false,
+                md: None,
+                dest_conflict: false,
+            });
+            continue;
+        };
+        let tier: Tier = s.tier.parse().unwrap_or(Tier::Semantic);
+        let pinned = matches!(
+            state.reader.page_meta(&req.from_workspace, &req.project, &s.path).await,
+            Ok(Some(ref m)) if m.pinned
+        );
+        let md = state.wiki.read_page(src_ws, src_proj, &path).ok();
+        // Compute the conflict decision once. The check is "is there a
+        // DIFFERENT page at this path?", which requires both the dest
+        // body and the source markdown — when either is missing, treat
+        // as no-conflict and let the copy loop's natural-path branch
+        // handle it (it'll either supersede a no-op or skip with a
+        // missing-md guard).
+        let dest_conflict = matches!(
+            (
+                state
+                    .reader
+                    .page_body_by_ids(dst_ws, dst_proj, s.path.as_str())
+                    .await,
+                &md,
+            ),
+            (Ok(Some(existing)), Some(md_ref))
+                if page_copy_differs(&existing, md_ref, &s.title, tier, pinned)
+        );
+        out.push(PreparedSourcePage {
+            path,
+            path_str: s.path.clone(),
+            title: s.title.clone(),
+            tier,
+            pinned,
+            md,
+            dest_conflict,
+        });
+    }
+    out
+}
+
+/// Execute the copy-purge merge once the destination has been
+/// resolved. Pulled out of `handle_move_project` so the orchestrator
+/// reads as "validate → branch → copy_purge_merge", and the copy
+/// loop's per-page IO runs through a pre-computed `PreparedSourcePage`
+/// instead of fetching the same metadata twice.
+async fn copy_purge_merge(
+    state: &AdminState,
+    req: &MoveProjectRequest,
+    src_ws: WorkspaceId,
+    src_proj: ProjectId,
+    dst_ws: WorkspaceId,
+    dst_proj: ProjectId,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Enumerate the source's latest pages (authoritative on is_latest).
+    let summaries = match state
+        .reader
+        .list_pages(&req.from_workspace, &req.project)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    // Single pass over the source: load each page's metadata + body
+    // AND classify the destination conflict, so the block pre-check
+    // and the copy loop don't re-query the same rows.
+    let prepared =
+        prepare_source_pages(state, req, src_ws, src_proj, dst_ws, dst_proj, &summaries).await;
+
+    // Under the default `block` policy, abort the WHOLE move now —
+    // before anything is copied — so the source stays intact and the
+    // operator resolves the conflicts or re-runs with an explicit
+    // overwrite/duplicate. Drives off the cached `dest_conflict_body`
+    // computed by `prepare_source_pages`.
+    if req.on_conflict == OnConflict::Block {
+        let blocking: Vec<String> = prepared
+            .iter()
+            .filter(|p| p.dest_conflict)
+            .map(|p| p.path_str.clone())
+            .collect();
+        if !blocking.is_empty() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "destination already has pages at these paths with different content; \
+                              resolve them or re-run with on_conflict=overwrite or on_conflict=duplicate",
+                    "conflicts": blocking,
+                })),
+            );
+        }
+    }
+
+    // Carry the source page embeddings over verbatim instead of recomputing
+    // them — embedding is the dominant per-page cost of a bulk move. Writes go
+    // through an embedder-less Wiki so `write_page` never re-embeds; we then
+    // store each source vector against the new page id. Only embeddings
+    // computed with the CURRENTLY configured embedder ({provider,model,dim})
+    // are loaded (load_embeddings filters on them), so the "one model per
+    // index" invariant holds; any page lacking a current-model embedding is
+    // simply copied without one (backfill later via `ai-memory embed`).
+    let copy_wiki = state.wiki.clone().without_embedder();
+    let mut src_embeddings: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
+    let embed_meta: Option<(String, String, u32)> = if let Some(embedder) = &state.embedder {
+        let (provider, model, dim) = (
+            embedder.provider().to_string(),
+            embedder.model().to_string(),
+            embedder.dim(),
+        );
+        match state
+            .reader
+            .load_embeddings(src_ws, src_proj, provider.clone(), model.clone(), dim)
+            .await
+        {
+            Ok(rows) => {
+                for e in rows {
+                    src_embeddings.insert(e.path.to_string(), f32_vec_to_bytes(&e.vector));
+                }
+                Some((provider, model, dim))
+            }
+            Err(e) => {
+                warn!(error = %e, "move-project: failed to load source embeddings; copies land without vectors");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // COPY each page through the (embedder-less) write path so sanitization,
+    // link re-resolution, FTS upsert (and admission/git-mirror on deploy) all
+    // fire — minus the per-page embed, which we carry over below. Drives off
+    // the prebuilt `PreparedSourcePage` vec so each page is read at most
+    // once across the whole merge (the previous version re-fetched in the
+    // pre-scan + the copy loop for Block-policy callers).
+    let mut pages_copied = 0u64;
+    let mut pages_skipped: Vec<String> = Vec::new();
+    let mut conflicts: Vec<PathConflict> = Vec::new();
+    let mut used_dest_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for p in prepared {
+        let Some(md) = p.md else {
+            // Either the path was unparseable or `read_page` failed —
+            // either way we cannot copy it. The presence of a skip
+            // here aborts the purge below.
+            warn!(
+                path = %p.path_str,
+                "move-project: source page unreadable or invalid path; skipping"
+            );
+            pages_skipped.push(p.path_str.clone());
+            continue;
+        };
+        // Apply the on_conflict policy using the cached classification.
+        // `block` was already handled by the pre-scan above so we never
+        // get here with `dest_conflict == true` AND `policy == Block`.
+        let dest_path = if p.dest_conflict {
+            match req.on_conflict {
+                OnConflict::Duplicate => {
+                    let deduped = dedup_dest_path(
+                        state,
+                        dst_ws,
+                        dst_proj,
+                        &p.path_str,
+                        &req.from_workspace,
+                        &used_dest_paths,
+                    )
+                    .await;
+                    conflicts.push(PathConflict {
+                        path: p.path_str.clone(),
+                        moved_to: deduped.as_str().to_string(),
+                    });
+                    deduped
+                }
+                OnConflict::Overwrite => {
+                    conflicts.push(PathConflict {
+                        path: p.path_str.clone(),
+                        moved_to: p.path_str.clone(),
+                    });
+                    p.path.clone()
+                }
+                OnConflict::Block => p.path.clone(), // unreachable
+            }
+        } else if used_dest_paths.contains(p.path_str.as_str()) {
+            // The natural path is already claimed by an earlier
+            // de-duplicated page; pick another to avoid clobbering it.
+            let deduped = dedup_dest_path(
+                state,
+                dst_ws,
+                dst_proj,
+                &p.path_str,
+                &req.from_workspace,
+                &used_dest_paths,
+            )
+            .await;
+            conflicts.push(PathConflict {
+                path: p.path_str.clone(),
+                moved_to: deduped.as_str().to_string(),
+            });
+            deduped
+        } else {
+            p.path.clone()
+        };
+        used_dest_paths.insert(dest_path.as_str().to_string());
+        let new_page_id = match copy_wiki
+            .write_page(WritePageRequest {
+                workspace_id: dst_ws,
+                project_id: dst_proj,
+                path: dest_path.clone(),
+                frontmatter: md.frontmatter,
+                body: md.body,
+                tier: p.tier,
+                pinned: p.pinned,
+                // Preserve the stored title verbatim (PageSummary.title is
+                // the DB-derived title), rather than re-deriving it.
+                title: Some(p.title.clone()),
+                // None → the write_page admission chain resolves the
+                // workspace/project NAMES from the destination IDs, so the
+                // git-mirror lands the copy under the destination path.
+                admission_ctx: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
+            })
+            .await
+        {
+            Ok(pid) => pid,
+            // ANY copy failure aborts BEFORE the purge — the source survives.
+            Err(e) => return internal_err(format!("copy of {} failed: {e}", p.path_str)),
+        };
+        // Carry the source embedding over (skip the re-embed) when the source
+        // had one for the current model.
+        if let (Some((provider, model, dim)), Some(bytes)) =
+            (&embed_meta, src_embeddings.get(&p.path_str))
+            && let Err(e) = state
+                .writer
+                .store_embedding(
+                    new_page_id,
+                    bytes.clone(),
+                    provider.clone(),
+                    model.clone(),
+                    *dim,
+                )
+                .await
+        {
+            warn!(path = %p.path_str, error = %e, "move-project: failed to carry embedding; page copied without it");
+        }
+        pages_copied += 1;
+    }
+
+    // Safety: a skipped (unreadable) source page blocks the purge — purging
+    // now would destroy data we failed to copy. Report and let the operator
+    // fix + re-run (re-running is idempotent: copied pages just supersede).
+    if !pages_skipped.is_empty() {
+        let report = MoveProjectReport {
+            from: format!("{}/{}", req.from_workspace, req.project),
+            to: format!("{}/{}", req.to_workspace, req.project),
+            // copy_purge_merge is only reached from the merge branch
+            // of handle_move_project; the destination project pre-existed.
+            merged_into_existing: true,
+            moved_via: "copy-purge",
+            pages_copied,
+            pages_skipped,
+            source_purged: false,
+            source_pages_deleted: 0,
+            source_sessions_deleted: 0,
+            source_observations_deleted: 0,
+            source_handoffs_deleted: 0,
+            source_embeddings_deleted: 0,
+            files_deleted: Vec::new(),
+            files_failed: Vec::new(),
+            conflicts,
+        };
+        return (
+            StatusCode::OK,
+            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        );
+    }
+
+    // PURGE the source — only reached when every page copied successfully.
+    // Admission must run BEFORE the DB destruction so a `failure_policy =
+    // reject` webhook can still abort the second leg of the move while the
+    // source is intact (mirrors `handle_purge_project`'s ordering). The
+    // previous version called `Wiki::purge_project` AFTER `writer.purge_project`,
+    // which ran admit AFTER the rows were gone — reject came too late.
+    let label = format!("{}/{}", req.from_workspace, req.project);
+    let purge_ctx = AdmissionContext {
+        workspace: req.from_workspace.clone(),
+        project: req.project.clone(),
+        op: AdmissionOp::PurgeProject,
+        ..Default::default()
+    };
+    let resolved_purge_ctx = match state
+        .wiki
+        .admit_purge_project(src_ws, src_proj, Some(purge_ctx))
+        .await
+    {
+        Ok(ctx) => ctx,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    let summary = match state.writer.purge_project(src_ws, src_proj, &label).await {
+        Ok(s) => s,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    // Remove the source's on-disk dir, then dispatch the non-blocking
+    // purge webhook. Pass the workspace/project NAMES we cached in
+    // `resolved_purge_ctx` — the DB rows have just been deleted, so a
+    // name-resolution lookup at dispatch time would find nothing.
+    let proj_root_str = state
+        .wiki
+        .project_root(src_ws, src_proj)
+        .display()
+        .to_string();
+    let mut files_deleted: Vec<String> = Vec::new();
+    let mut files_failed: Vec<String> = Vec::new();
+    match state.wiki.remove_project_dir(src_ws, src_proj) {
+        Ok(()) => files_deleted.push(proj_root_str),
+        Err(e) => {
+            warn!(path = %proj_root_str, error = %e, "move-project: failed to remove source dir");
+            files_failed.push(proj_root_str);
+        }
+    }
+    // See `handle_purge_project` for the rationale on `partial_failure`.
+    let mut dispatch_ctx = resolved_purge_ctx;
+    if !files_failed.is_empty()
+        && let Some(ref mut c) = dispatch_ctx
+    {
+        c.partial_failure = true;
+    }
+    state.wiki.dispatch_purge_project(dispatch_ctx.as_ref());
+
+    // The source project_id was just purged; if it was the published active
+    // project, the pointer now dangles — clear it so the next hook re-resolves
+    // to the (new) project rather than the deleted id.
+    if state.active_project.get().map(|(_, p)| p) == Some(src_proj) {
+        state.active_project.clear();
+    }
+    // Proactively drop any stale per-cwd cache entry for the purged source
+    // project (its project_id no longer exists).
+    if let Some(evict) = &state.on_project_moved {
+        evict(src_proj);
+    }
+
+    let report = MoveProjectReport {
+        from: label,
+        to: format!("{}/{}", req.to_workspace, req.project),
+        // copy_purge_merge is only reached from the merge branch.
+        merged_into_existing: true,
+        moved_via: "copy-purge",
+        pages_copied,
+        pages_skipped: Vec::new(),
+        source_purged: true,
+        source_pages_deleted: summary.pages_deleted,
+        source_sessions_deleted: summary.sessions_deleted,
+        source_observations_deleted: summary.observations_deleted,
+        source_handoffs_deleted: summary.handoffs_deleted,
+        source_embeddings_deleted: summary.embeddings_deleted,
+        files_deleted,
+        files_failed,
+        conflicts,
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
     )
 }
 
@@ -1725,6 +2587,96 @@ async fn handle_write_page(
             serde_json::to_value(WritePageResponse {
                 page_id: page_id.to_string(),
                 path: path.to_string(),
+            })
+            .unwrap_or_else(|_| serde_json::json!({})),
+        ),
+    ))
+}
+
+// ---------------------------------------------------------------------
+// delete-page
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/delete-page`.
+///
+/// Unlike `memory_delete_page` (MCP), this endpoint REQUIRES explicit
+/// `workspace` so cross-workspace ambiguity can never silently route a
+/// delete to the wrong slot.
+#[derive(Deserialize)]
+struct DeletePageAdminRequest {
+    /// Workspace name. Required (no auto-create — delete acts on existing data).
+    workspace: String,
+    /// Project name within the workspace. Required.
+    project: String,
+    /// Relative wiki path (e.g. `concepts/foo.md`).
+    path: String,
+}
+
+/// JSON response body for `POST /admin/delete-page`.
+#[derive(Serialize)]
+struct DeletePageResponse {
+    /// Canonical wiki path of the deletion target.
+    path: String,
+    /// Always `true` on a successful (resolved-scope) call. `Wiki::delete_page`
+    /// itself is idempotent — a missing file is treated as already-deleted —
+    /// so the boolean reports "the call succeeded", not "a row was removed".
+    /// The structural defense is in the 404 returned when `(workspace, project)`
+    /// fails to resolve (so a stale or wrong-scope call never returns a misleading
+    /// `deleted: true`).
+    deleted: bool,
+}
+
+async fn handle_delete_page(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    headers: HeaderMap,
+    Json(req): Json<DeletePageAdminRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let path = PagePath::new(req.path.clone()).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": format!("invalid path: {e}") })),
+        )
+    })?;
+
+    // Use the no-create lookup (same as purge/rename/move): a delete on a
+    // typo'd workspace/project must return 404, NOT silently auto-create
+    // empty containers and then return `deleted: true` for nothing.
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let skip_webhooks = match level_ext.map(|axum::Extension(level)| level) {
+        Some(ai_memory_core::AuthLevel::User) => Vec::new(),
+        Some(ai_memory_core::AuthLevel::Root | ai_memory_core::AuthLevel::Anonymous) | None => {
+            crate::actor::skip_webhooks_from_headers(&headers)
+        }
+    };
+    let admission_ctx = if actor.has_any() || !skip_webhooks.is_empty() {
+        Some(AdmissionContext {
+            actor,
+            op: AdmissionOp::Delete,
+            skip_webhooks,
+            ..AdmissionContext::default()
+        })
+    } else {
+        None
+    };
+
+    state
+        .wiki
+        .delete_page(ws, proj, &path, admission_ctx)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+
+    Ok((
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(DeletePageResponse {
+                path: path.to_string(),
+                deleted: true,
             })
             .unwrap_or_else(|_| serde_json::json!({})),
         ),
@@ -2036,6 +2988,8 @@ mod tests {
             bind: "127.0.0.1:49374".to_string(),
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            on_project_moved: None,
         });
 
         let resp = router
@@ -2072,6 +3026,8 @@ mod tests {
             bind: "127.0.0.1:49374".to_string(),
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            on_project_moved: None,
         });
         (tmp, router)
     }
@@ -2251,6 +3207,8 @@ mod tests {
             bind: "127.0.0.1:49374".to_string(),
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            on_project_moved: None,
         });
 
         post_write_page(&router, "default", "doomed", "notes/x.md", "bye").await;
@@ -2310,6 +3268,8 @@ mod tests {
             bind: "127.0.0.1:49374".to_string(),
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: Some(pepper),
+            active_project: ai_memory_core::ActiveProject::new(),
+            on_project_moved: None,
         });
         // Wrap in a middleware that stamps the AuthLevel ourselves —
         // the real auth middleware lives in ai-memory-cli, and this
@@ -2355,6 +3315,145 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn multiuser_operational_admin_routes_reject_db_user_tier() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let routes = [
+            ("POST", "/admin/backup", serde_json::Value::Null),
+            (
+                "POST",
+                "/admin/bootstrap",
+                serde_json::json!({
+                    "workspace": "default",
+                    "project": "scratch",
+                    "sources": [],
+                    "dry_run": true
+                }),
+            ),
+            ("GET", "/admin/status", serde_json::Value::Null),
+            ("GET", "/admin/search?q=test", serde_json::Value::Null),
+            (
+                "GET",
+                "/admin/read-page?workspace=default&project=scratch&path=notes/x.md",
+                serde_json::Value::Null,
+            ),
+            ("POST", "/admin/reorg", serde_json::json!({"dry_run": true})),
+            (
+                "POST",
+                "/admin/lint",
+                serde_json::json!({"workspace": "default", "project": "scratch", "dry_run": true}),
+            ),
+            (
+                "POST",
+                "/admin/forget-sweep",
+                serde_json::json!({"workspace": "default", "project": "scratch", "dry_run": true}),
+            ),
+            (
+                "POST",
+                "/admin/embed",
+                serde_json::json!({"workspace": "default", "project": "scratch", "dry_run": true}),
+            ),
+            (
+                "POST",
+                "/admin/commit",
+                serde_json::json!({"message": "test"}),
+            ),
+            (
+                "POST",
+                "/admin/purge-project",
+                serde_json::json!({"workspace": "default", "project": "scratch", "confirm": true}),
+            ),
+            (
+                "POST",
+                "/admin/rename-project",
+                serde_json::json!({"workspace": "default", "from": "scratch", "to": "renamed"}),
+            ),
+            (
+                "POST",
+                "/admin/move-project",
+                serde_json::json!({
+                    "from_workspace": "default",
+                    "to_workspace": "archive",
+                    "project": "scratch",
+                    "confirm": true
+                }),
+            ),
+            (
+                "POST",
+                "/admin/write-page",
+                serde_json::json!({
+                    "workspace": "default",
+                    "project": "scratch",
+                    "path": "notes/x.md",
+                    "body": "body"
+                }),
+            ),
+            (
+                "POST",
+                "/admin/delete-page",
+                serde_json::json!({
+                    "workspace": "default",
+                    "project": "scratch",
+                    "path": "notes/x.md"
+                }),
+            ),
+        ];
+
+        for (method, uri, payload) in routes {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", "Bearer db-user-token");
+            let body = if payload.is_null() {
+                Body::empty()
+            } else {
+                builder = builder.header("content-type", "application/json");
+                Body::from(serde_json::to_vec(&payload).unwrap())
+            };
+            let resp = router
+                .clone()
+                .oneshot(builder.body(body).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {uri} must be root-only in multi-user mode"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn multiuser_operational_admin_routes_reject_anonymous() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn multiuser_operational_admin_routes_allow_root() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/status")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -2594,6 +3693,8 @@ mod tests {
             bind: "127.0.0.1:49374".to_string(),
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            on_project_moved: None,
         });
         // Inject a Root level so we're past the require_root gate;
         // the 503 must come from require_pepper.
@@ -2620,5 +3721,130 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let _ = tmp;
+    }
+
+    // ---------------------------------------------------------------------
+    // delete-page
+    // ---------------------------------------------------------------------
+
+    /// Helper: POST /admin/delete-page and return (status, body json).
+    async fn post_delete_page(
+        router: &Router,
+        ws: &str,
+        project: &str,
+        path: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let req_body = serde_json::json!({
+            "workspace": ws,
+            "project": project,
+            "path": path,
+        });
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/delete-page")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn delete_page_removes_existing_page() {
+        let (_tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "audit", "notes/doomed.md", "bye body").await;
+
+        // Confirm the page is reachable before delete.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/read-page?workspace=default&project=audit&path=notes/doomed.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "setup precondition: page must exist before delete"
+        );
+
+        let (status, json) = post_delete_page(&router, "default", "audit", "notes/doomed.md").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["path"], "notes/doomed.md");
+        assert_eq!(json["deleted"], true);
+
+        // Read-back must now 404.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/read-page?workspace=default&project=audit&path=notes/doomed.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "page must be gone after delete"
+        );
+    }
+
+    /// A delete request whose `(workspace, project)` doesn't resolve to a
+    /// real `(WorkspaceId, ProjectId)` must NOT report success. The shared
+    /// `resolve_ws_proj` returns the unresolved-scope error; the handler
+    /// surfaces it as a 4xx/5xx — never as `deleted: true`. This guards the
+    /// Bug 5 regression where MCP `memory_delete_page` returned `true` for
+    /// a scope it never touched.
+    #[tokio::test]
+    async fn delete_page_unknown_workspace_does_not_fake_success() {
+        let (_tmp, router) = read_page_test_router();
+        let (status, json) =
+            post_delete_page(&router, "no-such-ws", "audit", "notes/whatever.md").await;
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "delete on unresolved scope must not return 200/deleted=true; got body {json:?}",
+        );
+        assert!(
+            json.get("deleted").and_then(|v| v.as_bool()) != Some(true),
+            "body must not claim deleted=true on unresolved scope; got {json:?}"
+        );
+    }
+
+    /// `Wiki::delete_page` is idempotent for a path that doesn't exist
+    /// inside an EXISTING (workspace, project) — the file is just not there
+    /// to quarantine. The handler reports `deleted: true` (i.e. "the call
+    /// succeeded") rather than 404, matching the documented MCP semantics.
+    #[tokio::test]
+    async fn delete_page_idempotent_for_missing_file_in_existing_scope() {
+        let (_tmp, router) = read_page_test_router();
+        // Seed the project so (workspace, project) resolves, but skip the
+        // page we'll try to delete.
+        post_write_page(&router, "default", "audit", "notes/keep.md", "keeper").await;
+
+        let (status, json) =
+            post_delete_page(&router, "default", "audit", "notes/never-existed.md").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["deleted"], true);
+    }
+
+    #[tokio::test]
+    async fn delete_page_traversal_rejected_with_422() {
+        let (_tmp, router) = read_page_test_router();
+        let (status, _) = post_delete_page(&router, "default", "audit", "../etc/passwd").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 }
