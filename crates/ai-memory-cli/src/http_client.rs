@@ -44,16 +44,18 @@ impl ServerEndpoint {
     /// 1. the **path component of `AI_MEMORY_SERVER_URL`** (the remote-client
     ///    case — `http://host:49374/wiki` → origin `http://host:49374`,
     ///    base `/wiki`), then
-    /// 2. **`AI_MEMORY_BASE_PATH`** (the in-pod case — the CLI runs in the
-    ///    same container as `serve`, which already reads this var to nest
-    ///    its router).
+    /// 2. **`Config::base_path`** (the in-pod case — figment populates the
+    ///    field from `AI_MEMORY_BASE_PATH` inside `Config::load`, keeping the
+    ///    "one config-read path" invariant; the CLI runs in the same
+    ///    container as `serve`, which already reads the same env var via
+    ///    clap to nest its router).
     #[must_use]
     pub fn from_config(config: &Config) -> Self {
         Self::build(
             Some(config.server_url.clone()),
             config.auth.bearer_token.clone(),
             config.server_url_configured(),
-            std::env::var("AI_MEMORY_BASE_PATH").ok(),
+            Some(config.base_path.clone()).filter(|s| !s.is_empty()),
         )
     }
 

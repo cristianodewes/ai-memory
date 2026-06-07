@@ -51,6 +51,16 @@ pub struct Config {
     pub bind: String,
     /// Base URL used by thin-client CLI commands to contact the running server.
     pub server_url: String,
+    /// URL subpath the server is mounted under (e.g. `/wiki`). Thin-client
+    /// CLI commands prepend it to every `/admin/*` request so deployments
+    /// hosted behind a reverse proxy under a subpath don't 404. Settable via
+    /// `AI_MEMORY_BASE_PATH`. Empty for root-mounted deployments (the
+    /// default). The `serve` subcommand reads the same env var via clap and
+    /// nests its router accordingly; this field is what the thin-client
+    /// path needs to discover the same prefix without a second
+    /// `std::env::var` call (invariant: one config-read path).
+    #[serde(default)]
+    pub base_path: String,
     /// Per-subsystem log filter (overridable by `RUST_LOG`).
     pub log_level: String,
     /// Optional LLM provider (`anthropic`, `openai`, `gemini`, `openai-compat`, `openai-oauth`, `copilot`).
@@ -319,6 +329,7 @@ impl Default for Config {
             data_dir: default_data_dir(),
             bind: DEFAULT_BIND.into(),
             server_url: DEFAULT_SERVER_URL.into(),
+            base_path: String::new(),
             log_level: "info".into(),
             llm_provider: None,
             llm_model: None,
