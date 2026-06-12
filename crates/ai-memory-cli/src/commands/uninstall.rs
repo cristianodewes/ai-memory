@@ -183,6 +183,7 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             Openclaw,
             Pi,
             AntigravityCli,
+            VsCodeCopilot,
         ] {
             let Ok(path) = install_mcp::mcp_config_path(client) else {
                 continue;
@@ -588,6 +589,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::AntigravityCli => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
         McpClient::Openclaw => Some(&["mcp", "servers"]),
+        McpClient::VsCodeCopilot => Some(&["servers"]),
         McpClient::Codex => None,
     }
 }
@@ -1120,6 +1122,23 @@ mod tests {
         assert_eq!(removed, vec!["ai-memory".to_string()]);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["mcp"].get("servers").is_none());
+    }
+
+    #[test]
+    fn strip_mcp_vscode_copilot_root_servers() {
+        let content = r#"{"servers":{"ai-memory":{"type":"http","url":"http://127.0.0.1:49374/mcp"},"other":{"type":"http","url":"http://x"}}}"#;
+        let (out, removed) = strip_mcp_json(
+            content,
+            McpClient::VsCodeCopilot,
+            Some("ai-memory"),
+            "http://127.0.0.1:49374/mcp",
+        )
+        .unwrap();
+
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["servers"].get("ai-memory").is_none());
+        assert!(v["servers"].get("other").is_some());
     }
 
     #[test]

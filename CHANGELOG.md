@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-06-12
+### Fixed
+- Session-page tool-call counts no longer double every entry. The
+  no-LLM synthesizer was counting both `PreToolUse` and `PostToolUse`
+  observations into the same bucket, so a single Bash call rendered
+  as `Bash: 2` and two real calls as `Bash: 4`. It now counts only
+  `PostToolUse` (the "completed call" event), matching the user-facing
+  meaning of the heading.
+
+## [1.0.1] - 2026-06-12
+### Added
+- `install-mcp --client vscode-copilot` renders (and `--apply` writes) a
+  workspace-scoped `.vscode/mcp.json` for VS Code GitHub Copilot's agent
+  mode. The renderer uses VS Code's MCP framework schema — top-level
+  `servers` key, `type: "http"`, `url`, and an inline `headers` map for
+  the bearer token — and includes a note that VS Code Copilot does not
+  yet expose lifecycle hooks, so ai-memory's automatic capture is not
+  active there (the MCP tools must be called explicitly from chat).
+  Aliases: `copilot`, `github-copilot`. `uninstall --only mcp` strips
+  the same entry idempotently.
+
+## [1.0.0] - 2026-06-12
+### Added
+- Native hook drain and handoff timings can now be raised with
+  `AI_MEMORY_HOOK_DRAIN_TIMEOUT_MINUTES`,
+  `AI_MEMORY_HOOK_HANDOFF_TIMEOUT_MINUTES`,
+  `AI_MEMORY_HOOK_START_BUDGET_MINUTES`, and
+  `AI_MEMORY_HOOK_END_BUDGET_MINUTES` for high-latency or large-backlog
+  instances. Defaults preserve the existing short hook behavior; invalid,
+  zero, or overly large values fall back or clamp safely.
+
 ## [0.16.0] - 2026-06-11
 ### Added
 - Native Claude Code hooks on macOS/Linux now use the direct
@@ -929,7 +960,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.2
+[1.0.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.1
+[1.0.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.0
 [0.16.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.16.0
 [0.15.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.15.0
 [0.14.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.14.0

@@ -9,7 +9,7 @@ path (docker + Claude Code). This page covers everything else:
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, OpenCode, OMP, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, OpenClaw)
+  (Codex, OpenCode, OMP, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, OpenClaw, VS Code Copilot)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -324,6 +324,21 @@ then stages runnable copies under `~/.local/share/ai-memory/hooks/<agent>/` so
 the agent can execute files owned by your user. Re-run `install-hooks --apply`
 after package upgrades to refresh those staged copies.
 
+Native `ai-memory hook --event ...` commands spool events locally and drain them
+at session boundaries. The built-in timings stay short by default, but
+high-latency or large-backlog instances can raise them with whole-minute runtime
+env vars in the agent's environment; no `install-hooks` rerun is needed:
+
+| Env var | Built-in default | Max override | What it caps |
+|---|---:|---:|---|
+| `AI_MEMORY_HOOK_DRAIN_TIMEOUT_MINUTES` | 3 seconds | 60 minutes | each event POST during a drain |
+| `AI_MEMORY_HOOK_HANDOFF_TIMEOUT_MINUTES` | 3 seconds | 60 minutes | the synchronous `session-start` handoff GET |
+| `AI_MEMORY_HOOK_START_BUDGET_MINUTES` | 3 seconds | 60 minutes | total time the `session-start` cleanup drain may spend |
+| `AI_MEMORY_HOOK_END_BUDGET_MINUTES` | 10 seconds | 60 minutes | total time the `session-end` flush may spend |
+
+Values must be positive whole minutes. Missing, empty, non-numeric, or zero
+values fall back to the built-in defaults; values above 60 are clamped.
+
 ### Native service operations
 
 ```bash
@@ -513,7 +528,7 @@ files owned by the user running the command. Prefer it as the
 default; reach for `setup-agent` only when your docker setup is
 known not to remap UIDs.
 
-### Cursor, Gemini CLI, Claude Desktop, OpenClaw, Antigravity CLI
+### Cursor, Gemini CLI, Claude Desktop, OpenClaw, Antigravity CLI, VS Code Copilot
 
 See [**`docs/mcp-install.md`**](mcp-install.md) for the per-client MCP
 config file path and snippet, or one-shot it via:
@@ -554,11 +569,16 @@ docker run --rm akitaonrails/ai-memory:latest \
 docker run --rm akitaonrails/ai-memory:latest \
     install-hooks --agent openclaw       --auth-token "$TOKEN" \
     --server-url "http://homelab:49374"
+
+docker run --rm akitaonrails/ai-memory:latest \
+    install-mcp --client vscode-copilot  --auth-token "$TOKEN" \
+    --server-url "http://homelab:49374/mcp"
 ```
 
 Cursor, Gemini CLI, Antigravity CLI, and OpenClaw support both `install-mcp` and
-`install-hooks`. Claude Desktop is MCP-only here, so you'll need to
-nudge the model to call `memory_query` / `memory_handoff_accept` itself.
+`install-hooks`. Claude Desktop and VS Code Copilot are MCP-only here,
+so you'll need to nudge the model to call `memory_query` /
+`memory_handoff_accept` itself.
 For clients with `install-hooks` support, the capture path handles
 handoff injection at session start or the client's closest equivalent
 (Antigravity CLI uses `PreInvocation`).
@@ -1071,6 +1091,6 @@ write to `~/.local/share/ai-memory/hooks/`.
 - [`docs/usage.md`](usage.md) - handoffs, proactive querying, web UI,
   routing snippet, and raw-wiki inspection
 - [`docs/mcp-install.md`](mcp-install.md) - per-client MCP config
-  reference for Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, OpenClaw, OMP
+  reference for Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, OpenClaw, OMP, VS Code Copilot
 - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) - what's actually
   running inside ai-memory
