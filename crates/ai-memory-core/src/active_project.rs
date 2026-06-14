@@ -29,18 +29,19 @@
 //!   the same operator (one person with several Claude Code / Codex windows
 //!   in different repos at once).
 //! - `PerActor` keys by `(user, session_id)` when both coordinates are present
-//!   and also keeps a user-only fallback slot. That isolates across operators
-//!   even when a client cannot forward a per-session key, while preserving
-//!   per-session isolation for clients/bridges that do forward one. Pairs with
-//!   multi-user mode (rung 2): `user` comes from the `users` row that owns the
-//!   bearer token.
+//!   and also keeps a user-only slot for requests that truly have no session
+//!   coordinate. That isolates across operators while preserving per-session
+//!   isolation for clients/bridges that do forward one. Pairs with multi-user
+//!   mode (rung 2): `user` comes from the `users` row that owns the bearer
+//!   token.
 //!
 //! When the caller has no actor identity at all (anonymous request without a
 //! session, or a code path the migration has not threaded yet), every mode
 //! falls back to the single slot for backward compatibility. That is a legacy
-//! convenience, not isolation; session-aware clients should forward a session
-//! key, and shared authenticated installs should use `PerActor` so user-scoped
-//! fallback applies before the global slot. The single slot is also what the
+//! convenience, not isolation. If a request provides a usable actor coordinate
+//! and the keyed lookup misses, `get_for` returns `None` instead of falling
+//! through to another session's latest project; callers then use their baked
+//! default or an explicit workspace/project. The single slot is also what the
 //! historical `set` / `get` / `clear` API touches, so existing callers compile
 //! unchanged and admin ops like `move-project` still invalidate the pointer
 //! correctly.
@@ -247,11 +248,9 @@ impl ActiveProject {
     ///   *and* the single slot is updated as well, so callers that have no
     ///   actor identity (anonymous probes, legacy code paths) still see the
     ///   latest project rather than an empty pointer.
-    /// - In `PerActor`, a user-only fallback entry is also set when `user` is
-    ///   present. Real MCP clients often cannot attach the hook payload's
-    ///   session id to every tool call; the user-only slot still prevents an
-    ///   authenticated Alice request from falling through to Bob's latest
-    ///   project in the global slot.
+    /// - In `PerActor`, a user-only entry is also set when `user` is present.
+    ///   Requests that carry that user but no session id can still resolve to
+    ///   the user's latest project without falling through to the global slot.
     pub fn set_for(&self, actor: &ActorKey, workspace_id: WorkspaceId, project_id: ProjectId) {
         self.write_single(workspace_id, project_id);
         if self.mode == ActiveProjectMode::Single || actor.is_empty() {
@@ -280,34 +279,27 @@ impl ActiveProject {
     }
 
     /// Read the currently active project for the given actor, if any has
-    /// been published yet. Falls back to the single slot when:
+    /// been published yet. Falls back to the single slot only when:
     /// - the mode is `Single`, or
-    /// - the actor is empty (no identity coordinates), or
-    /// - no per-actor entry matches (graceful degradation).
+    /// - the actor is empty, or has no coordinate usable by the selected mode.
+    ///
+    /// When a request provides a usable session/user coordinate and that keyed
+    /// entry is absent, return `None`. Falling through to the user/global latest
+    /// slot would route a remote MCP request with a mismatched session id into
+    /// whichever project published hook activity last.
     #[must_use]
     pub fn get_for(&self, actor: &ActorKey) -> Option<(WorkspaceId, ProjectId)> {
-        if self.mode != ActiveProjectMode::Single && !actor.is_empty() {
-            let scoped = self.scoped_key(actor);
-            if !scoped.is_empty() {
-                let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
-                if let Some(found) = guard.get(&scoped, Instant::now()) {
-                    return Some(found);
-                }
-                if self.mode == ActiveProjectMode::PerActor
-                    && scoped.user.is_some()
-                    && scoped.session_id.is_some()
-                {
-                    let user_only = ActorKey {
-                        user: scoped.user.clone(),
-                        session_id: None,
-                    };
-                    if let Some(found) = guard.get(&user_only, Instant::now()) {
-                        return Some(found);
-                    }
-                }
-            }
+        if self.mode == ActiveProjectMode::Single || actor.is_empty() {
+            return self.read_single();
         }
-        self.read_single()
+
+        let scoped = self.scoped_key(actor);
+        if scoped.is_empty() {
+            return self.read_single();
+        }
+
+        let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
+        guard.get(&scoped, Instant::now())
     }
 
     /// Project the actor's identity onto only the coordinates the current
@@ -363,10 +355,8 @@ impl ActiveProject {
         guard.entries.clear();
     }
 
-    /// Test-only: look up only the per-key backing store, bypassing the
-    /// single-slot fallback that the production `get_for` returns. Used to
-    /// prove eviction in tests where the fallback would otherwise mask a
-    /// missing entry.
+    /// Test-only: look up only the per-key backing store. Used to prove
+    /// eviction in tests without depending on the public fallback semantics.
     #[cfg(test)]
     fn keyed_only_get(&self, actor: &ActorKey) -> Option<(WorkspaceId, ProjectId)> {
         if self.mode == ActiveProjectMode::Single || actor.is_empty() {
@@ -553,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn per_actor_unknown_session_falls_back_to_user_slot() {
+    fn per_actor_unknown_session_does_not_fall_back_to_user_or_single_slot() {
         let ap = ActiveProject::with_mode(ActiveProjectMode::PerActor);
         let alice_a = key_actor("alice", "hook-session");
         let bob_a = key_actor("bob", "hook-session");
@@ -568,8 +558,13 @@ mod tests {
                 user: Some("alice".into()),
                 session_id: Some("different-mcp-session".into()),
             }),
-            Some((ws, p_alice)),
-            "mismatched session id should degrade to Alice's latest slot, not the global slot"
+            None,
+            "mismatched session id must not degrade to Alice's latest slot or the global slot"
+        );
+        assert_eq!(
+            ap.get(),
+            Some((ws, p_bob)),
+            "legacy single slot remains populated for actorless callers only"
         );
     }
 
@@ -609,9 +604,8 @@ mod tests {
         ap.set_for(&k2, ws, p2);
         std::thread::sleep(Duration::from_millis(2));
         ap.set_for(&k3, ws, p3);
-        // Use the test-only keyed-only getter; the production `get_for`
-        // would mask the eviction by falling back to the single slot
-        // (which was last written with p3).
+        // Use the test-only keyed-only getter so the cap assertion targets
+        // the backing map directly.
         assert!(ap.keyed_only_get(&k1).is_none(), "k1 must be evicted");
         assert_eq!(ap.keyed_only_get(&k2), Some((ws, p2)));
         assert_eq!(ap.keyed_only_get(&k3), Some((ws, p3)));
@@ -630,11 +624,8 @@ mod tests {
         ap.set_for(&k, ws, proj);
         assert_eq!(ap.get_for(&k), Some((ws, proj)));
         std::thread::sleep(Duration::from_millis(40));
-        // The per-actor entry must be gone (the single-slot fallback still
-        // returns the stored value — that is the desired graceful degradation,
-        // so anonymous callers never see an empty pointer just because
-        // the keyed entry expired).
-        ap.clear();
+        // The per-actor entry must be gone; identified callers with expired
+        // keyed entries must not fall through to a stale latest-project slot.
         assert!(ap.get_for(&k).is_none());
     }
 
@@ -846,7 +837,6 @@ mod tests {
     /// Property: TTL is monotonic in time — once an entry has expired
     /// (the per-key TTL has elapsed since its last `set_for`), no
     /// `get_for` lookup should ever see it again via the *keyed* path.
-    /// The single-slot fallback is allowed (graceful degradation).
     #[test]
     fn prop_expired_entry_is_not_resurrected_via_keyed_path() {
         let ws = WorkspaceId::new();
@@ -872,8 +862,7 @@ mod tests {
             std::thread::sleep(ttl + Duration::from_millis(30));
 
             // Now hit each actor with `keyed_only_get`. None of them
-            // should resurrect: even though `get_for` would fall back
-            // to the single slot, `keyed_only_get` must return None.
+            // should resurrect.
             for (idx, actor) in actors.iter().enumerate() {
                 assert!(
                     ap.keyed_only_get(actor).is_none(),

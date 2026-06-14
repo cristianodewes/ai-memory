@@ -196,9 +196,9 @@ async fn bearer_lookup(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     // No token → anonymous. This mirrors require_bearer's rung 0/
-    // unrecognised-Bearer behaviour for our autoscope test:
-    // ActorContext is injected with no `user`, so PerActor falls back
-    // to the single slot (intentional graceful degradation).
+    // unrecognised-Bearer behavior for our autoscope test:
+    // ActorContext is injected with no `user`, so PerActor must not match
+    // any authenticated user's keyed slot.
     let bearer = req
         .headers()
         .get("authorization")
@@ -380,12 +380,11 @@ async fn per_actor_isolates_real_bearer_users() {
 
 // ────────────────────────────────────────────────────────────────────────────
 // A request without a Bearer token authenticates as anonymous → no
-// `user` in the actor key. PerActor falls back to the single slot; the
-// MCP read sees whatever was last published there. The key invariant
-// here is *no leak of a DB-user's slot* to anonymous callers — i.e.
-// the per-actor map must NOT serve user1's pointer to an anonymous
-// request, because the keys `(user1, sess)` and `(None, sess)` are
-// distinct.
+// `user` in the actor key. If it still carries a session id, PerActor
+// must fail closed rather than falling through to the latest authenticated
+// user's slot. The per-actor map must NOT serve user1's pointer to an
+// anonymous request, because the keys `(user1, sess)` and `(None, sess)`
+// are distinct.
 // ────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -400,11 +399,8 @@ async fn anonymous_request_does_not_inherit_user_slot() {
 
     // Anonymous read with the SAME session id. Because `user` differs
     // (`None` vs `Some("user1")`), the per_actor slot is a different
-    // key, and the slot is empty for anonymous → fallback to single
-    // slot. The single slot was last written by user1's hook, so this
-    // is acceptable graceful degradation; the *strict* invariant we
-    // pin is that an anonymous read MUST NOT come back keyed as
-    // user1 in the actor-aware path.
+    // key, and the slot is empty for anonymous. That must return the baked
+    // default rather than user1's latest hook-published project.
     let resp = h
         .router
         .clone()
@@ -435,10 +431,12 @@ async fn anonymous_request_does_not_inherit_user_slot() {
         .expect("anon mcp oneshot");
     assert_eq!(resp.status(), StatusCode::OK);
     // Body must parse cleanly; engine must not crash on anonymous +
-    // per_actor mode. Content can be anything (likely user1's project
-    // via single-slot fallback) — that's documented graceful
-    // degradation.
-    let _ = tool_text(&response_text(resp).await);
+    // per_actor mode, and must not leak user1's marker via fallback.
+    let text = tool_text(&response_text(resp).await);
+    assert!(
+        !text.contains(number_word(user1.project_index)),
+        "anonymous request leaked user1 marker via fallback:\n{text}"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -468,17 +466,10 @@ async fn unknown_bearer_does_not_match_any_user_slot() {
     let text = tool_text(&body);
 
     // The forged caller's key is `(None, sess)` after the middleware's
-    // anonymous-fallback. It must NOT key into user1's `(Some("user1"),
-    // sess)` slot. The acceptable outcomes are:
-    //   - empty hits (no per-actor slot, no single-slot match), or
-    //   - single-slot fallback content from whatever was last published
-    //     (which here is alphaone — user1's hook).
-    // The forbidden outcome is the request being *attributed* to
-    // user1's actor identity in any downstream write/audit. We can't
-    // assert that from a read body alone, but the read result is
-    // bounded by the slot semantics: same alpha as legit user, but
-    // routed via single-slot fallback, never via a spoofed per-actor
-    // hit. Documentation test; the load-bearing assertion is the
-    // multi-user one above.
-    let _ = text;
+    // anonymous fallback. It must NOT key into user1's `(Some("user1"),
+    // sess)` slot or fall through to user1's latest project.
+    assert!(
+        !text.contains(number_word(user1.project_index)),
+        "unknown bearer request leaked user1 marker via fallback:\n{text}"
+    );
 }

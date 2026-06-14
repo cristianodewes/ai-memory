@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upgraded servers (the antigravity/`V11` precedent).
 
 ### Fixed
+- Actor-scoped MCP tool calls no longer fall through to a user's or process's
+  latest hook-published project when the request carries a session id that does
+  not match hook activity. This prevents HTTP-remote shared servers from reading
+  or writing another same-user project when the MCP transport session id differs
+  from the hook session id ([#97]).
 - `memory_handoff_begin` and `memory_handoff_accept` now accept an optional
   `workspace` argument alongside `project`, resolving through the same
   workspace+project path as `memory_write_page` (begin, create-if-missing) and

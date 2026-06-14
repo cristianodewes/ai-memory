@@ -565,6 +565,41 @@ async fn per_actor_isolates_users_sharing_session_id() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_actor_unknown_mcp_session_does_not_use_latest_user_slot() {
+    let h = Harness::build(
+        ActiveProjectMode::PerActor,
+        TEST_TTL,
+        ai_memory_core::DEFAULT_MAX_ENTRIES,
+    )
+    .await;
+
+    // Issue #97: HTTP MCP requests carry their own MCP session id, not the
+    // hook payload's session id. If the keyed lookup misses, falling back to
+    // Alice's user-only "latest project" slot makes one repo read another.
+    fire_hook_and_settle(&h.router, Some("alice"), "hook-session-a", 1).await;
+    fire_hook_and_settle(&h.router, Some("alice"), "hook-session-b", 4).await;
+
+    let resp = h
+        .router
+        .clone()
+        .oneshot(mcp_query_request(
+            Some("alice"),
+            Some("mcp-session-from-http"),
+        ))
+        .await
+        .expect("mismatched mcp-session read");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = extract_tool_text(&response_body_text(resp).await);
+
+    for leaked in [number_word(1), number_word(4)] {
+        assert!(
+            !text.contains(leaked),
+            "unmatched MCP session must not fall back to Alice's hook-published latest project {leaked:?}:\n{text}"
+        );
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Scenario 4 — burst above max_entries: engine survives, no panic / no 5xx.
 // ────────────────────────────────────────────────────────────────────────────
@@ -685,10 +720,8 @@ async fn ttl_eviction_under_concurrent_insertion() {
 
     // Phase 3: parallel reads after expiry. The per-session entries are
     // gone; reads must NOT panic and must NOT return cross-actor data.
-    // `get_for` falls back to the single slot (last writer wins) — that
-    // is the documented graceful-degradation behaviour, so reads
-    // resolving to the LAST hook's project is acceptable; what's not
-    // acceptable is a 500 or a JSON-RPC error.
+    // Missing keyed entries fail closed to the baked default, so what's not
+    // acceptable is a 500, a JSON-RPC error, or a foreign marker.
     let mut handles = Vec::new();
     for i in 0..N {
         let router = h.router.clone();
@@ -704,8 +737,14 @@ async fn ttl_eviction_under_concurrent_insertion() {
                 "post-TTL read {i} status must be 200"
             );
             let body = response_body_text(resp).await;
-            // No JSON-RPC error.
-            let _ = extract_tool_text(&body);
+            let text = extract_tool_text(&body);
+            for j in 1..=SEEDED_PROJECTS {
+                let foreign = number_word(j);
+                assert!(
+                    !text.contains(foreign),
+                    "expired session {i} leaked seeded project marker {foreign:?}:\n{text}"
+                );
+            }
         }));
     }
     for h in handles {
@@ -751,11 +790,10 @@ async fn header_session_id_is_cache_key_not_credential() {
         .expect("bob spoof read");
     let bob_text = extract_tool_text(&response_body_text(resp).await);
 
-    // Bob hooked nothing, so his per-actor slot is empty; the resolver
-    // falls back to the single slot (which Alice's hook also wrote). To
-    // avoid that false negative, we make Bob also hook to a DIFFERENT
-    // project first so his slot is populated with the WRONG project for
-    // the spoof scenario.
+    // Bob hooked nothing, so his per-actor slot is empty. Make Bob also hook
+    // to a different project; the spoofed request still keys by the unmatched
+    // `(bob, alice-session)` tuple and must not fall back to either Alice's
+    // project or Bob's latest project.
     fire_hook_and_settle(&h.router, Some("bob"), "bob-own-session", 7).await;
     let resp = h
         .router
@@ -764,20 +802,14 @@ async fn header_session_id_is_cache_key_not_credential() {
         .await
         .expect("bob spoof read 2");
     let bob_text_after_own_hook = extract_tool_text(&response_body_text(resp).await);
-    // The legitimate Bob slot is keyed by `(bob, bob-own-session)`.
-    // The spoof request keys `(bob, alice-session)` — a completely fresh
-    // slot. Today the implementation gracefully falls back to the single
-    // slot (last writer wins) when the keyed entry is missing, so Bob
-    // sees whatever was last written there. This test documents the
-    // exact behaviour and asserts that Bob CANNOT see proj-2 via
-    // (alice, alice-session) — i.e. the *user* check holds even when the
-    // header is forged.
+    // The legitimate Bob slot is keyed by `(bob, bob-own-session)`. The spoof
+    // request keys `(bob, alice-session)` — a fresh slot — and must fail closed
+    // instead of falling through to the single/user latest slot.
     let _ = bob_text; // first probe kept for diagnostics
     assert!(
         !bob_text_after_own_hook.contains(number_word(2))
-            || bob_text_after_own_hook.contains(number_word(7)),
-        "header forgery must not give bob direct access to alice's proj-2 \
-         (acceptable fallback: bob's own proj-7).\nGot: {bob_text_after_own_hook}"
+            && !bob_text_after_own_hook.contains(number_word(7)),
+        "header forgery must not fall back to alice's proj-2 or bob's latest proj-7.\nGot: {bob_text_after_own_hook}"
     );
 }
 
@@ -823,7 +855,7 @@ async fn sustained_per_session_isolation_holds_under_continuous_traffic() {
     // The sustained loop below intentionally does not sleep between hook and
     // read, but without this initial barrier op #0 can race before the first
     // asynchronous hook processor has ever published that session's entry and
-    // legitimately fall back to the global compatibility slot.
+    // legitimately miss its own marker before the keyed slot exists.
     for i in 1..=SESSIONS {
         let session = format!("sustained-sess-{i}");
         let resp = h

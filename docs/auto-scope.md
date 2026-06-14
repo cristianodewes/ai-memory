@@ -23,7 +23,7 @@ separated.
 |---------------|------------------------|----------------------------------------------------------------------------------------------------------|
 | `single`      | (none — global slot)   | **Default.** Single operator, one project at a time. Backward-compatible with every existing install.    |
 | `per_session` | `session_id`           | Session-aware clients/bridges that forward the hook session id on every MCP request. |
-| `per_actor`   | `(user, session_id)`, with a user-only fallback | Shared engine fielding multiple authenticated users (multi-user mode, rung 2). Isolates across operators even when the MCP client cannot forward a session id. |
+| `per_actor`   | `(user, session_id)`, with a user-only no-session slot | Shared engine fielding multiple authenticated users (multi-user mode, rung 2). Isolates across operators and fails closed when a forwarded session id does not match hook activity. |
 
 Both opt-in modes still publish to the single slot in parallel, so a
 caller with no actor identity (anonymous probe, legacy code path) sees
@@ -63,11 +63,11 @@ AI_MEMORY_AUTO_SCOPE__MAX_ENTRIES=8192
 
 `per_session` reads from `session_id`; `per_actor` reads from both
 `user` and `session_id`. In `per_actor`, a request that has `user` but
-no matching `session_id` falls back to that user's latest slot before
-falling back to the process-wide single slot. That keeps Alice's MCP
-request from inheriting Bob's project on authenticated shared servers,
-but it does not isolate two simultaneous sessions for the same user
-unless the MCP client forwards a matching session id.
+no session id can use that user's latest no-session slot instead of the
+process-wide single slot. A request that does carry a session id must
+match a hook-published keyed entry; if it does not, ai-memory falls back
+to the server's baked default rather than another session's latest
+project.
 
 ## Client requirements
 
@@ -80,17 +80,18 @@ call.
 Use `per_session` only when your client or bridge can send the same
 opaque session id from the hook payload on each MCP request as
 `X-Memory-Actor-Session-Id` (preferred) or `Mcp-Session-Id`. Otherwise
-`per_session` degrades to the legacy single slot, so concurrent sessions
-can still overwrite each other's current-project pointer.
+requests that carry a different MCP session id fail closed to the baked
+default, while requests with no usable actor identity still degrade to
+the legacy single slot.
 
 For built-in installs that use static MCP config, prefer:
 
 - `single` for one operator / one active project at a time.
 - `per_actor` with multi-user bearer auth when several humans share one
-  server. It isolates users via the authenticated `user` fallback even
-  when their clients cannot forward session ids, but same-user
+  server. It isolates users via authenticated actor keys; same-user
   concurrent sessions still need explicit `workspace` + `project` args
-  or a session-aware bridge.
+  or a session-aware bridge when the MCP client cannot forward the hook
+  session id.
 
 ## Pairing with multi-user mode
 
