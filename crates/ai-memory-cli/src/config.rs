@@ -29,6 +29,10 @@ pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:49374";
 /// Default MCP endpoint URL rendered for client integrations.
 pub const DEFAULT_MCP_URL: &str = "http://127.0.0.1:49374/mcp";
 
+/// Default confidence floor for staged auto-improvement proposals.
+pub const DEFAULT_AUTO_IMPROVE_MIN_CONFIDENCE: f32 =
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MIN_CONFIDENCE;
+
 /// Default workspace name used by the single-workspace v1 flow.
 pub const DEFAULT_WORKSPACE: &str = ai_memory_core::DEFAULT_WORKSPACE_NAME;
 
@@ -101,6 +105,8 @@ pub struct Config {
     pub decay: ai_memory_store::DecayParams,
     /// Server-side scheduled maintenance. Jobs run outside hook latency.
     pub maintenance: MaintenanceSettings,
+    /// Optional post-session auto-improvement reviewer. Off by default.
+    pub auto_improve: AutoImproveSettings,
     /// Privacy-strip tuning. Built-in patterns always run; this section
     /// lets the operator extend or punch holes in them.
     pub sanitize: ai_memory_core::SanitizeConfig,
@@ -342,6 +348,7 @@ impl Default for Config {
             embedding_base_url: None,
             decay: ai_memory_store::DecayParams::default(),
             maintenance: MaintenanceSettings::default(),
+            auto_improve: AutoImproveSettings::default(),
             sanitize: ai_memory_core::SanitizeConfig::default(),
             auth: AuthSettings::default(),
             auto_scope: AutoScopeSettings::default(),
@@ -349,6 +356,68 @@ impl Default for Config {
             cors_allow_origins: Vec::new(),
             admission_webhooks: Vec::new(),
             runtime_env: RuntimeEnv::default(),
+        }
+    }
+}
+
+/// Write mode for the optional auto-improvement loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoImproveMode {
+    /// Report-only preview; no wiki or pending-proposal writes.
+    #[default]
+    DryRun,
+    /// Store proposals for human approval. Intended default once storage ships.
+    Stage,
+    /// Future mode only: apply narrow high-confidence proposals automatically.
+    AutoApply,
+}
+
+/// `[auto_improve]` optional post-session reviewer settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoImproveSettings {
+    /// Master switch. Defaults to false; manual dry-runs can still pass
+    /// explicit CLI flags without enabling the session-end trigger.
+    pub enabled: bool,
+    /// Configured write mode. The first shipped command supports dry-run only.
+    pub mode: AutoImproveMode,
+    /// Whether SessionEnd should schedule a reviewer run. Defaults off so hooks
+    /// stay cheap and fire-and-forget.
+    pub on_session_end: bool,
+    /// Minimum observations before a session is worth reviewing.
+    pub min_observations: usize,
+    /// Minimum span between first and last observation before review.
+    pub min_session_duration_secs: u64,
+    /// Minimum model confidence accepted by validation.
+    pub min_confidence: f32,
+    /// Approximate chars/4 prompt budget for review input.
+    pub max_input_tokens: usize,
+    /// Maximum validated proposals returned from one run.
+    pub max_proposals_per_run: usize,
+    /// Whether future reviewers may include raw observation fallback details.
+    pub include_raw_fallback: bool,
+    /// Synthetic actor used for autonomous proposal provenance.
+    pub proposal_actor: String,
+    /// Wiki-relative pending proposal folder once staging ships.
+    pub pending_path: String,
+}
+
+impl Default for AutoImproveSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: AutoImproveMode::DryRun,
+            on_session_end: false,
+            min_observations: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MIN_OBSERVATIONS,
+            min_session_duration_secs:
+                ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MIN_SESSION_DURATION_SECS,
+            min_confidence: DEFAULT_AUTO_IMPROVE_MIN_CONFIDENCE,
+            max_input_tokens: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_INPUT_TOKENS,
+            max_proposals_per_run: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS,
+            include_raw_fallback: false,
+            proposal_actor: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR.into(),
+            pending_path: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PENDING_PATH.into(),
         }
     }
 }
@@ -735,6 +804,20 @@ mod tests {
         assert_eq!(cfg.maintenance.forget_sweep_interval_secs, 86_400);
         assert_eq!(cfg.maintenance.lint_interval_secs, 86_400);
         assert_eq!(cfg.maintenance.embedding_backfill_interval_secs, 0);
+        assert!(cfg.auto_improve.enabled);
+        assert_eq!(cfg.auto_improve.mode, AutoImproveMode::DryRun);
+        assert!(!cfg.auto_improve.on_session_end);
+        assert_eq!(cfg.auto_improve.min_observations, 8);
+        assert_eq!(cfg.auto_improve.min_session_duration_secs, 120);
+        assert_eq!(
+            cfg.auto_improve.min_confidence,
+            DEFAULT_AUTO_IMPROVE_MIN_CONFIDENCE
+        );
+        assert_eq!(cfg.auto_improve.max_input_tokens, 24_000);
+        assert_eq!(cfg.auto_improve.max_proposals_per_run, 5);
+        assert!(!cfg.auto_improve.include_raw_fallback);
+        assert_eq!(cfg.auto_improve.proposal_actor, "auto_improve");
+        assert_eq!(cfg.auto_improve.pending_path, "_pending/auto-improve");
     }
 
     #[test]
@@ -767,6 +850,19 @@ mod tests {
             [maintenance]
             enabled = false
             lint_interval_secs = 3600
+
+            [auto_improve]
+            enabled = true
+            mode = "dry_run"
+            on_session_end = true
+            min_observations = 3
+            min_session_duration_secs = 45
+            min_confidence = 0.9
+            max_input_tokens = 12000
+            max_proposals_per_run = 2
+            include_raw_fallback = true
+            proposal_actor = "review_bot"
+            pending_path = "_pending/review-bot"
             "#,
         )
         .unwrap();
@@ -778,6 +874,17 @@ mod tests {
         assert_eq!(cfg.log_level, "debug");
         assert!(!cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.lint_interval_secs, 3600);
+        assert!(cfg.auto_improve.enabled);
+        assert_eq!(cfg.auto_improve.mode, AutoImproveMode::DryRun);
+        assert!(cfg.auto_improve.on_session_end);
+        assert_eq!(cfg.auto_improve.min_observations, 3);
+        assert_eq!(cfg.auto_improve.min_session_duration_secs, 45);
+        assert_eq!(cfg.auto_improve.min_confidence, 0.9);
+        assert_eq!(cfg.auto_improve.max_input_tokens, 12_000);
+        assert_eq!(cfg.auto_improve.max_proposals_per_run, 2);
+        assert!(cfg.auto_improve.include_raw_fallback);
+        assert_eq!(cfg.auto_improve.proposal_actor, "review_bot");
+        assert_eq!(cfg.auto_improve.pending_path, "_pending/review-bot");
     }
 
     #[test]

@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use ai_memory_consolidate::{Consolidator, run_lint, run_sweep};
+use ai_memory_consolidate::{
+    AutoImproveReviewConfig, Consolidator, run_auto_improve_review, run_lint, run_sweep,
+};
 use ai_memory_core::{
     ActiveProject, AgentKind, HandoffId, HandoffState, NewHandoff, PageId, PagePath, ProjectId,
     SessionId, Tier, WorkspaceId,
@@ -88,6 +90,12 @@ the conversation calls for them:\n\
 - `memory_consolidate` — when the user asks to compile session \
   observations into wiki pages. Also runs on PreCompact, and at \
   session end only when AI_MEMORY_CONSOLIDATE_ON_SESSION_END is set.\n\
+- `memory_auto_improve` — when the user asks what durable lessons \
+  should be proposed from a completed session, or at explicit wrap-up \
+  when learning review is useful. Dry-run only for now: it reads the \
+  latest completed session by default, returns proposed wiki edits with \
+  evidence, and never writes pages or pending proposals. Do NOT apply \
+  proposals with memory_write_page unless the user explicitly approves.\n\
 - `memory_write_page` — when the user explicitly asks to remember, \
   save, or annotate durable project knowledge. This writes a wiki page; \
   do NOT use `memory_handoff_begin` for permanent annotations. \
@@ -133,6 +141,17 @@ mean the page is empty (a large page can match outside the snippet \
 window); to read the whole page use `memory_read_page` (by `path`, \
 or a `query` for the top hit's body; add `workspace` + `project` \
 together only for a named sibling workspace/project).\n\
+\n\
+**Use retrieved memory as operating guidance, not trivia.** When \
+`memory_query` or `memory_recent` returns `_rules/`, `gotchas/`, \
+`procedures/`, or `decisions/` pages relevant to the task, read the \
+full page with `memory_read_page` before acting. Treat `_rules/` as \
+constraints, `gotchas/` as preflight warnings, `procedures/` as \
+checklists, and `decisions/` as settled architecture unless the user \
+explicitly asks to revisit them. Before non-trivial coding, debugging, \
+deployment, release, auth, scope, migration, PR-review, or \
+data-preservation work, search memory for the subsystem and task type \
+first.\n\
 \n\
 The routing snippet this very text comes from can also be installed \
 into the project's CLAUDE.md / AGENTS.md so the guidance survives \
@@ -315,6 +334,45 @@ struct ConsolidateArgs {
     /// If true, M7b multi-page atomic fan-out. Default false (single page).
     #[serde(default)]
     multi_page: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct AutoImproveArgs {
+    /// Completed session UUID to review. Omit to review the latest completed
+    /// session in the resolved current project.
+    #[serde(default)]
+    session_id: Option<String>,
+    /// Must be true or omitted. The MCP surface is dry-run only until pending
+    /// proposal storage and approval tools exist.
+    #[serde(default)]
+    dry_run: Option<bool>,
+    /// Project to review. Omit to target the project you're currently working
+    /// in (resolved from recent hook activity). **Omit unless the user
+    /// explicitly names a different project.**
+    #[serde(default)]
+    project: Option<String>,
+    /// Workspace to review together with `project`. Omit for the
+    /// current/default workspace resolution chain.
+    #[serde(default)]
+    workspace: Option<String>,
+    /// Override the minimum observation count for this run.
+    #[serde(default)]
+    min_observations: Option<usize>,
+    /// Override the minimum session span for this run.
+    #[serde(default)]
+    min_session_duration_secs: Option<u64>,
+    /// Override the proposal confidence floor for this run.
+    #[serde(default)]
+    min_confidence: Option<f32>,
+    /// Override the approximate chars/4 input token budget for this run.
+    #[serde(default)]
+    max_input_tokens: Option<usize>,
+    /// Override the maximum validated proposal count for this run.
+    #[serde(default)]
+    max_proposals: Option<usize>,
+    /// Include raw fallback context when the reviewer supports it.
+    #[serde(default)]
+    include_raw_fallback: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1078,6 +1136,77 @@ impl AiMemoryServer {
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             ok_json(&outcome)
         }
+    }
+
+    /// Dry-run durable wiki edit proposals for a completed session.
+    #[tool(
+        description = "Run a DRY-RUN auto-improvement review for one completed session. Use when the user asks what durable lessons should be proposed, what memory pages this session suggests, or at explicit wrap-up when a learning review is useful. Omit `session_id` to review the latest completed session in the current project. This is read-only: it never writes wiki files, pending proposals, or handoffs. Do NOT apply proposals with memory_write_page unless the user explicitly approves."
+    )]
+    async fn memory_auto_improve(
+        &self,
+        Parameters(args): Parameters<AutoImproveArgs>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        if args.dry_run == Some(false) {
+            return Err(McpError::invalid_params(
+                "memory_auto_improve currently supports dry-run only",
+                None,
+            ));
+        }
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
+        let (ws, proj) = self
+            .effective_ids_for_read_args_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+            )
+            .await?;
+        let Some(llm) = self.llm.as_ref() else {
+            return Err(McpError::internal_error(
+                "memory_auto_improve not configured (set AI_MEMORY_LLM_PROVIDER on the server)",
+                None,
+            ));
+        };
+        let session_id = match args.session_id.as_deref() {
+            Some(raw) => SessionId::from_str(raw)
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?,
+            None => self
+                .reader
+                .latest_completed_session_for_project(ws, proj)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                .ok_or_else(|| {
+                    McpError::internal_error(
+                        "no completed session found for the resolved project",
+                        None,
+                    )
+                })?,
+        };
+        let cfg = AutoImproveReviewConfig {
+            min_observations: args
+                .min_observations
+                .unwrap_or(ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MIN_OBSERVATIONS),
+            min_session_duration_secs: args
+                .min_session_duration_secs
+                .unwrap_or(ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MIN_SESSION_DURATION_SECS),
+            min_confidence: args
+                .min_confidence
+                .unwrap_or(ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MIN_CONFIDENCE),
+            max_input_tokens: args
+                .max_input_tokens
+                .unwrap_or(ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_INPUT_TOKENS),
+            max_proposals_per_run: args
+                .max_proposals
+                .unwrap_or(ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS),
+            include_raw_fallback: args.include_raw_fallback.unwrap_or(false),
+            proposal_actor: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR.into(),
+            pending_path: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PENDING_PATH.into(),
+        };
+
+        let report = run_auto_improve_review(&self.reader, &**llm, ws, proj, session_id, cfg)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        ok_json(&report)
     }
 
     /// Write or update a durable wiki page.
@@ -1993,6 +2122,7 @@ mod tests {
             "memory_handoff_begin",
             "memory_handoff_cancel",
             "memory_consolidate",
+            "memory_auto_improve",
             "memory_write_page",
             "memory_read_page",
             "memory_delete_page",
@@ -2097,6 +2227,62 @@ mod tests {
                 "prompt must explicitly disallow handoffs for permanent notes"
             );
         }
+    }
+
+    #[test]
+    fn prompts_treat_retrieved_memory_as_actionable_guidance() {
+        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+            let lower = prompt.to_ascii_lowercase();
+            assert!(
+                prompt.contains("_rules/")
+                    && prompt.contains("gotchas/")
+                    && prompt.contains("procedures/")
+                    && prompt.contains("decisions/"),
+                "prompt must name actionable page families"
+            );
+            assert!(
+                lower.contains("constraints")
+                    && lower.contains("preflight")
+                    && lower.contains("checklists"),
+                "prompt must teach how to use rules/gotchas/procedures"
+            );
+            assert!(
+                lower.contains("before non-trivial")
+                    && lower.contains("auth")
+                    && lower.contains("migration"),
+                "prompt must make proactive retrieval the default for risky work"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prompts_expose_auto_improve_as_dry_run_only() {
+        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+            let lower = prompt.to_ascii_lowercase();
+            assert!(prompt.contains("memory_auto_improve"));
+            assert!(lower.contains("dry-run") || lower.contains("dry run"));
+            assert!(
+                lower.contains("never writes") || lower.contains("never write"),
+                "prompt must state auto-improve review is non-mutating"
+            );
+            assert!(
+                lower.contains("explicitly approves") || lower.contains("explicitly approve"),
+                "prompt must require explicit approval before applying proposals"
+            );
+        }
+
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let tools = server.tool_router.list_all();
+        let auto_improve = tools
+            .iter()
+            .find(|t| t.name == "memory_auto_improve")
+            .expect("memory_auto_improve must be registered");
+        let desc = auto_improve
+            .description
+            .as_deref()
+            .expect("memory_auto_improve must carry a description");
+        assert!(desc.contains("DRY-RUN") || desc.contains("dry-run"));
+        assert!(desc.contains("never writes"));
     }
 
     #[test]
@@ -3968,6 +4154,62 @@ mod tests {
             }))
             .await
             .expect_err("must reject when no consolidator is configured");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("not configured"),
+            "error should mention configuration: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_auto_improve_rejects_non_dry_run() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let err = server
+            .memory_auto_improve(
+                Parameters(AutoImproveArgs {
+                    session_id: None,
+                    dry_run: Some(false),
+                    project: None,
+                    workspace: None,
+                    min_observations: None,
+                    min_session_duration_secs: None,
+                    min_confidence: None,
+                    max_input_tokens: None,
+                    max_proposals: None,
+                    include_raw_fallback: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .expect_err("auto-improve MCP tool must be dry-run only");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("dry-run"),
+            "error should mention dry-run: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_auto_improve_without_provider_errors_cleanly() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let err = server
+            .memory_auto_improve(
+                Parameters(AutoImproveArgs {
+                    session_id: Some("00000000-0000-0000-0000-000000000000".into()),
+                    dry_run: Some(true),
+                    project: None,
+                    workspace: None,
+                    min_observations: None,
+                    min_session_duration_secs: None,
+                    min_confidence: None,
+                    max_input_tokens: None,
+                    max_proposals: None,
+                    include_raw_fallback: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .expect_err("must reject when no LLM provider is configured");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("not configured"),

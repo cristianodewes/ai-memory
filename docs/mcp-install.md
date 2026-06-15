@@ -36,7 +36,7 @@ endpoint. The trade-off:
 
 | | What you get | What you don't get |
 |---|---|---|
-| **MCP only** | LLM can query the wiki, accept handoffs, run memory_consolidate | No automatic session-end summaries; no auto-handoff at session boundaries |
+| **MCP only** | LLM can query the wiki, accept handoffs, run memory_consolidate, and dry-run `memory_auto_improve` learning reviews | No automatic session-end summaries; no auto-handoff at session boundaries |
 | **MCP + hooks** | All of the above *plus* every prompt/tool-call captured automatically; handoffs surface at SessionStart with no human prompting | - |
 
 For MCP-only use, you can still cover the session-boundary gap by asking
@@ -488,7 +488,7 @@ You: List the MCP tools you can call. Use one of them to check
 Model (any client): I can call: memory_query, memory_recent,
      memory_status, memory_briefing, memory_explore,
      memory_handoff_accept, memory_handoff_begin, memory_handoff_cancel,
-     memory_consolidate, memory_write_page, memory_read_page, memory_delete_page,
+     memory_consolidate, memory_auto_improve, memory_write_page, memory_read_page, memory_delete_page,
      memory_lint, memory_forget_sweep, memory_install_self_routing.
      memory_status reports: 0 pages, 0 observations, 0 sessions.
 ```

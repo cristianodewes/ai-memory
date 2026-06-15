@@ -65,10 +65,18 @@ ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
 ```
 
-The CLI commands (`bootstrap`, `status`, `search`, `lint`, etc.) inherit the
-two env vars automatically. So do `install-mcp`, `install-hooks`, and
+The CLI commands (`bootstrap`, `status`, `search`, `lint`, `auto-improve
+--dry-run`, etc.) inherit the two env vars automatically. So do `install-mcp`,
+`install-hooks`, and
 `setup-agent`: with `AI_MEMORY_SERVER_URL` set, `install-mcp` derives the
 `/mcp` endpoint and `install-hooks` uses the bare server origin.
+
+After upgrading ai-memory, refresh the managed routing block in existing
+projects so Claude Code/OpenCode/Codex/Gemini pick up new tool guidance and
+proactive retrieval rules. From an agent, ask "refresh the ai-memory routing in
+this project"; from the terminal, run `ai-memory install-instructions` (or pass
+`--target AGENTS.md` for non-Claude prompt files). The update is idempotent and
+only replaces the `<!-- ai-memory:start -->` / `<!-- ai-memory:end -->` block.
 
 ---
 

@@ -918,6 +918,35 @@ impl ReaderPool {
         .await
     }
 
+    /// Return the latest completed session for a project.
+    ///
+    /// Used by read-only review tools that need a natural default when the user
+    /// asks what the project just learned without naming a session id.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn latest_completed_session_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Option<SessionId>> {
+        self.with_conn(move |conn| {
+            let row_opt: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT id FROM sessions \
+                     WHERE workspace_id = ?1 AND project_id = ?2 AND ended_at IS NOT NULL \
+                     ORDER BY ended_at DESC, started_at DESC LIMIT 1",
+                    params![workspace_id.as_bytes(), project_id.as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            row_opt
+                .map(|bytes| SessionId::from_slice(&bytes).map_err(StoreError::from))
+                .transpose()
+        })
+        .await
+    }
+
     /// Look up the `(workspace_id, project_id)` a session belongs to.
     /// Returns `None` when no such session row exists.
     ///

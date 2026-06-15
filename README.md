@@ -89,14 +89,14 @@ priors are at the [bottom](#influences-and-prior-art).
   session-aware current-project routing.
 - **Thin-client CLI.** `ai-memory status`, `bootstrap`, `checkpoints`,
   `restore-page`, `purge-project`, `rename-project`, `move-project`, `lint`,
-  `embed`, `forget-sweep`, `backup` are
+  `auto-improve --dry-run`, `embed`, `forget-sweep`, `backup` are
   all HTTP clients of the running server - never touch SQLite or
   wiki files directly. `status` also reports passive LLM/embedding
   provider health from the last real provider call. Server is the
   single source of truth.
 - **LLM is opt-in.** Zero-LLM mode still gives you FTS5 search +
   rule-based summarisation. Add a provider when you want consolidated
-  pages and lint contradictions.
+  pages, lint contradictions, or dry-run auto-improvement proposals.
 
 ## Use cases
 
@@ -128,6 +128,12 @@ priors are at the [bottom](#influences-and-prior-art).
   `git log`, README, `docs/`, module headers, project rules and
   one-shot-summarises them into seed wiki pages. Future sessions
   build on top.
+- **"What durable lesson did that session teach?"**
+  `ai-memory auto-improve --dry-run --session-id <uuid>` reviews one completed
+  session with the configured LLM and returns validated proposed wiki edits. It
+  is report-only for now: no pending pages or durable wiki files are written.
+  Agents can also call `memory_auto_improve` to review the latest completed
+  session in the current project without knowing the session id.
 - **"Run one ai-memory for the whole household."** Stand the server
   up on a homelab box at `0.0.0.0:49374` with a bearer token; every
   laptop/desktop talks to it. Per-cwd routing keeps each project's
@@ -269,8 +275,17 @@ use `--mcp-url` if you installed MCP with a custom endpoint, and
   MCP/hooks. Explicit `--server-url` flags still work, but are no longer
   required when the env vars are set. Any non-loopback server should use
   bearer auth.
-- **Upgrades:** run `ai-memory upgrade` to refresh the wrapper, image,
-  and staged hook scripts. Redeploy remote servers separately.
+- **Upgrades:** for Docker-wrapper installs, run `ai-memory upgrade` on each
+  agent machine. It refreshes the local wrapper, pulls the latest image, and
+  re-stages hook scripts under `~/.local/share/ai-memory/hooks/<agent>/`.
+  Native package/source installs should rerun
+  `ai-memory install-hooks --agent <agent> --apply` after upgrading the binary.
+  Remote/homelab servers must still be redeployed separately; local wrapper
+  upgrade only updates the client machine. Existing project prompt files keep
+  working, but refresh the managed ai-memory routing block
+  (`ai-memory install-instructions`, or `--target AGENTS.md` for AGENTS-based
+  projects) when you want new tool guidance such as proactive retrieval and
+  `memory_auto_improve`.
 
 For Codex, OpenCode, OMP, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI,
 Grok Build CLI, OpenClaw, VS Code Copilot, curl-based hook installs, source builds,

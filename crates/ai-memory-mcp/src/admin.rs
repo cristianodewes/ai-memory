@@ -4,6 +4,7 @@
 //! - `POST /admin/backup`         — snapshot db + wiki into a gzip tarball (binary response).
 //! - `POST /admin/bootstrap`      — ingest a pre-collected source bundle
 //!   into seed wiki pages via the configured LLM provider.
+//! - `POST /admin/auto-improve`   — dry-run durable wiki edit proposals for one session.
 //! - `GET  /admin/status`         — lifetime counts + server data-dir info.
 //! - `GET  /admin/search?q=`      — FTS5 hits against the wiki index.
 //! - `POST /admin/reorg`          — retro-fit sessions to per-cwd projects.
@@ -31,8 +32,8 @@ use std::io::Seek;
 use std::path::PathBuf;
 
 use ai_memory_consolidate::{
-    Bootstrap, BootstrapConfig, BootstrapOutcome, BootstrapSource, SourceCounts,
-    prune_sources_to_budget, run_lint, run_sweep,
+    AutoImproveReviewConfig, Bootstrap, BootstrapConfig, BootstrapOutcome, BootstrapSource,
+    SourceCounts, prune_sources_to_budget, run_auto_improve_review, run_lint, run_sweep,
 };
 use ai_memory_core::{
     ActiveProject, Capability, DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME, PagePath, ProjectId,
@@ -149,9 +150,79 @@ fn default_chunk_input_tokens() -> usize {
     ai_memory_consolidate::DEFAULT_CHUNK_INPUT_TOKENS
 }
 
+/// JSON request body for `POST /admin/auto-improve`.
+#[derive(Deserialize)]
+struct AutoImproveRequest {
+    /// Workspace name (must already exist).
+    #[serde(default = "default_workspace")]
+    workspace: String,
+    /// Project name (must already exist).
+    #[serde(default = "default_project")]
+    project: String,
+    /// Completed session to review.
+    session_id: SessionId,
+    /// Required for the first implementation slice. Live staging/apply is not
+    /// available until pending proposal storage ships.
+    #[serde(default)]
+    dry_run: bool,
+    /// Minimum observations before the LLM review runs.
+    #[serde(default = "default_auto_improve_min_observations")]
+    min_observations: usize,
+    /// Minimum session span before the LLM review runs.
+    #[serde(default = "default_auto_improve_min_session_duration_secs")]
+    min_session_duration_secs: u64,
+    /// Minimum proposal confidence accepted by validation.
+    #[serde(default = "default_auto_improve_min_confidence")]
+    min_confidence: f32,
+    /// Approximate chars/4 prompt budget.
+    #[serde(default = "default_auto_improve_max_input_tokens")]
+    max_input_tokens: usize,
+    /// Maximum validated proposals returned.
+    #[serde(default = "default_auto_improve_max_proposals")]
+    max_proposals_per_run: usize,
+    /// Whether future raw fallback details may be considered.
+    #[serde(default)]
+    include_raw_fallback: bool,
+    /// Synthetic actor reserved for future staged proposal provenance.
+    #[serde(default = "default_auto_improve_proposal_actor")]
+    proposal_actor: String,
+    /// Pending proposal folder reserved for future staging.
+    #[serde(default = "default_auto_improve_pending_path")]
+    pending_path: String,
+}
+
+fn default_auto_improve_min_observations() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MIN_OBSERVATIONS
+}
+
+fn default_auto_improve_min_session_duration_secs() -> u64 {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MIN_SESSION_DURATION_SECS
+}
+
+fn default_auto_improve_min_confidence() -> f32 {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MIN_CONFIDENCE
+}
+
+fn default_auto_improve_max_input_tokens() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_INPUT_TOKENS
+}
+
+fn default_auto_improve_max_proposals() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS
+}
+
+fn default_auto_improve_proposal_actor() -> String {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR.into()
+}
+
+fn default_auto_improve_pending_path() -> String {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PENDING_PATH.into()
+}
+
 /// Build the admin axum [`Router`]. Mounts:
 /// - `POST /admin/backup`
 /// - `POST /admin/bootstrap`
+/// - `POST /admin/auto-improve`
 /// - `GET  /admin/status`
 /// - `GET  /admin/search`
 /// - `GET  /admin/read-page`
@@ -173,6 +244,7 @@ pub fn admin_router(state: AdminState) -> Router {
     let operational = Router::new()
         .route("/admin/backup", post(handle_backup))
         .route("/admin/bootstrap", post(handle_bootstrap))
+        .route("/admin/auto-improve", post(handle_auto_improve))
         .route("/admin/status", get(handle_status))
         .route("/admin/search", get(handle_search))
         .route("/admin/read-page", get(handle_read_page))
@@ -833,6 +905,69 @@ fn dry_run_outcome(
         StatusCode::OK,
         Json(serde_json::to_value(&outcome).unwrap_or_else(|_| serde_json::json!({}))),
     ))
+}
+
+// ---------------------------------------------------------------------
+// auto-improve dry-run reviewer
+// ---------------------------------------------------------------------
+
+async fn handle_auto_improve(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<AutoImproveRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    if !req.dry_run {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "auto-improve currently supports --dry-run only; pending proposal storage is not implemented yet"
+            })),
+        ));
+    }
+
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+    let Some(llm) = state.llm.as_ref().cloned() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "LLM provider not configured on server"
+            })),
+        ));
+    };
+
+    let cfg = AutoImproveReviewConfig {
+        min_observations: req.min_observations,
+        min_session_duration_secs: req.min_session_duration_secs,
+        min_confidence: req.min_confidence,
+        max_input_tokens: req.max_input_tokens,
+        max_proposals_per_run: req.max_proposals_per_run,
+        include_raw_fallback: req.include_raw_fallback,
+        proposal_actor: req.proposal_actor,
+        pending_path: req.pending_path,
+    };
+
+    run_auto_improve_review(&state.reader, &*llm, ws, proj, req.session_id, cfg)
+        .await
+        .map(|report| {
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+            )
+        })
+        .map_err(auto_improve_error_response)
+}
+
+fn auto_improve_error_response(
+    e: ai_memory_consolidate::AutoImproveError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use ai_memory_consolidate::AutoImproveError;
+    let status = match &e {
+        AutoImproveError::SessionNotFound(_) => StatusCode::NOT_FOUND,
+        AutoImproveError::SessionOutOfScope { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        AutoImproveError::Llm(_) => StatusCode::BAD_GATEWAY,
+        AutoImproveError::Memory(_) => StatusCode::BAD_REQUEST,
+        AutoImproveError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(serde_json::json!({ "error": e.to_string() })))
 }
 
 // ---------------------------------------------------------------------
@@ -3455,6 +3590,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_improve_rejects_non_dry_run_for_now() {
+        let (_tmp, router) = read_page_test_router();
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "audit",
+                            "session_id": "00000000-0000-0000-0000-000000000000",
+                            "dry_run": false
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("dry-run")
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_missing_scope_does_not_fall_back_before_llm_check() {
+        let (_tmp, router) = read_page_test_router();
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "missing",
+                            "project": "missing",
+                            "session_id": "00000000-0000-0000-0000-000000000000",
+                            "dry_run": true
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn read_page_missing_path_returns_404() {
         let (_tmp, router) = read_page_test_router();
 
@@ -4023,6 +4220,16 @@ mod tests {
                     "workspace": "default",
                     "project": "scratch",
                     "sources": [],
+                    "dry_run": true
+                }),
+            ),
+            (
+                "POST",
+                "/admin/auto-improve",
+                serde_json::json!({
+                    "workspace": "default",
+                    "project": "scratch",
+                    "session_id": "00000000-0000-0000-0000-000000000000",
                     "dry_run": true
                 }),
             ),

@@ -8,12 +8,21 @@
 //!
 //! M7b extends this to multi-page atomic fan-out.
 
+pub mod auto_improve;
 pub mod bootstrap;
 pub mod consolidator;
 pub mod lint;
 pub mod sweep;
 pub mod types;
 
+pub use auto_improve::{
+    AutoImproveError, AutoImproveEvidence, AutoImproveLlmResponse, AutoImproveProposal,
+    AutoImproveRejectedCandidate, AutoImproveReport, AutoImproveReviewConfig,
+    DEFAULT_AUTO_IMPROVE_MAX_INPUT_TOKENS, DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS,
+    DEFAULT_AUTO_IMPROVE_MIN_CONFIDENCE, DEFAULT_AUTO_IMPROVE_MIN_OBSERVATIONS,
+    DEFAULT_AUTO_IMPROVE_MIN_SESSION_DURATION_SECS, DEFAULT_AUTO_IMPROVE_PENDING_PATH,
+    DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR, run_auto_improve_review,
+};
 pub use bootstrap::{
     Bootstrap, BootstrapConfig, BootstrapError, BootstrapOutcome, BootstrapSource,
     DEFAULT_CHUNK_INPUT_TOKENS, ProjectNameStrategy, SourceCounts, SourceKind, collect_sources,

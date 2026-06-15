@@ -724,6 +724,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn latest_completed_session_for_project_ignores_open_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        let first = SessionId::new();
+        let open = SessionId::new();
+        for id in [first, open] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::OpenCode,
+                    cwd: None,
+                })
+                .await
+                .unwrap();
+        }
+        store.writer.end_session(first, None).await.unwrap();
+
+        assert_eq!(
+            store
+                .reader
+                .latest_completed_session_for_project(ws, proj)
+                .await
+                .unwrap(),
+            Some(first)
+        );
+    }
+
+    #[tokio::test]
     async fn list_projects_with_stats_returns_aggregates() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();

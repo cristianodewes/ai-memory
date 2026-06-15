@@ -225,14 +225,14 @@ crates/
 ├── ai-memory-hooks/       payload schemas, sanitiser, /hook ingress.
 ├── ai-memory-llm/         provider auth boundary + LlmProvider / Embedder traits.
 ├── ai-memory-consolidate/ Karpathy ingest / lint / sweep pipeline.
-└── ai-memory-cli/         `ai-memory` binary entry point + 17 subcommands.
+└── ai-memory-cli/         `ai-memory` binary entry point + thin HTTP subcommands.
 ```
 
 Each crate has a single responsibility and exposes a typed API. No
 circular deps. Inter-crate boundaries enforce the cross-cutting
 invariants below.
 
-## MCP tool surface (15 tools)
+## MCP tool surface (16 tools)
 
 | Tool | Hint | Purpose |
 |---|---|---|
@@ -246,6 +246,7 @@ invariants below.
 | `memory_handoff_accept` | destructive | Fetch + ack the latest open handoff (auto-cwd-matched by default). Optional `workspace` + `project` targets a named sibling workspace/project. |
 | `memory_handoff_cancel` | destructive | Mark an exact open handoff id expired when it was created by mistake. |
 | `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out. |
+| `memory_auto_improve` | read-only | Dry-run durable wiki edit proposals for a completed session. Defaults to the latest completed session in the resolved current project and never writes pages or pending proposals. |
 | `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate something permanent. |
 | `memory_delete_page` | destructive | Delete a single page by exact `path`. Fires the admission chain (op=delete); idempotent. |
 | `memory_forget_sweep` | destructive | M8 retention pass. `dry_run=true` for preview. |
@@ -253,8 +254,8 @@ invariants below.
 | `memory_install_self_routing` | read-only | Return the canonical routing snippet for CLAUDE.md / AGENTS.md. |
 
 `memory_briefing`, `memory_explore`, `memory_write_page`,
-`memory_install_self_routing`, `memory_read_page`, `memory_delete_page`, and
-`memory_handoff_cancel`
+`memory_install_self_routing`, `memory_read_page`, `memory_delete_page`,
+`memory_handoff_cancel`, and `memory_auto_improve`
 post-date the original "narrow on purpose" cut (§10 of
 `design-decisions.md`): briefing/explore separate the structured vs.
 prose halves of "what's going on", `memory_write_page` covers explicit
@@ -263,7 +264,8 @@ durable annotations without abusing single-use handoffs,
 must re-write its own routing rules into a project's `CLAUDE.md` /
 `AGENTS.md`, `memory_read_page` complements `memory_query` for the
 "I need the full page, not a snippet" case (e.g. opening a decision page
-end-to-end), and `memory_delete_page` is the exact-path destructive pair
+end-to-end), `memory_auto_improve` exposes a safe default-on learning review
+without mutation, and `memory_delete_page` is the exact-path destructive pair
 needed by admission-aware mirrors. `memory_handoff_cancel` is the safety valve
 for mistaken handoff creation. The narrow-surface discipline still holds —
 every new tool has to earn its slot — but the v1 count is 15, not 10.
@@ -276,14 +278,16 @@ cwd parameters use their canonical names.
 
 ```
 init                 status               search
-write-page           serve                reset
-backup               restore              install-hooks
-install-mcp          commit               llm-test
-forget-sweep         lint                 embed
-generate-auth-token  setup-agent          bootstrap
-install-instructions reorg                purge-project
-rename-project       move-project         uninstall
-auth
+read-page            write-page           delete-page
+serve                reset                backup
+restore              reindex              install-hooks
+hook                 install-mcp          commit
+checkpoints          restore-page         llm-test
+forget-sweep         lint                 auto-improve
+embed                generate-auth-token  setup-agent
+bootstrap            install-instructions reorg
+purge-project        rename-project       move-project
+uninstall            auth                 user
 ```
 
 Run `ai-memory --help` for the full tree.

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added a dry-run-only auto-improvement reviewer: `ai-memory auto-improve
+  --dry-run --session-id <uuid>` calls `POST /admin/auto-improve`, reads one
+  completed session, applies preflight noise filters, samples large sessions via
+  the consolidated session page plus high-signal observations, asks the
+  configured LLM for structured durable wiki edit proposals, validates
+  path/evidence/confidence and duplicate existing path/title constraints, and
+  returns a report without writing wiki files or pending proposals. New
+  `[auto_improve]` config defaults are enabled in safe `dry_run` mode, with no
+  session-end trigger or writes unless a future staged/apply mode is explicitly
+  enabled. Thresholds remain configurable: confidence, input budget, proposal
+  cap, `auto_improve` attribution, and `_pending/auto-improve` staging path.
+- Added read-only MCP tool `memory_auto_improve` so agents can dry-run learning
+  review for the latest completed session (or a named session) without shelling
+  out. The canonical MCP instructions and installed CLAUDE.md/AGENTS.md routing
+  snippet now teach agents to treat `_rules/`, `gotchas/`, `procedures/`, and
+  `decisions/` as actionable guidance for proactive retrieval.
+
+### Changed
+- Clarified upgrade guidance: Docker-wrapper users should run
+  `ai-memory upgrade` on each agent machine to refresh the wrapper, pulled
+  image, and staged hook scripts; native package/source installs should rerun
+  `install-hooks --apply` after binary upgrades; remote servers still need a
+  separate redeploy; and existing projects can refresh the managed routing block
+  to pick up new proactive retrieval and `memory_auto_improve` guidance.
+
 ### Fixed
 - Admin destructive ops (`/admin/purge-project`, `/admin/move-project`) now
   propagate the authenticated actor (from the auth middleware's

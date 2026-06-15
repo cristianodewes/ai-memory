@@ -78,6 +78,7 @@ dependencies = [
  "ai-memory-store",
  "ai-memory-wiki",
  "anyhow",
+ "async-trait",
  "git2",
  "jiff",
  "rusqlite",

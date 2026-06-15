@@ -43,6 +43,8 @@ pub enum PageKind {
     /// "Claude Code's session-end fires twice when /exit is typed
     /// during a tool call".
     Gotcha,
+    /// A reusable multi-step workflow or operating procedure.
+    Procedure,
     /// Anything that doesn't fit a stronger category. The default —
     /// keeps existing call sites that don't classify explicitly
     /// working unchanged.
@@ -58,6 +60,7 @@ impl PageKind {
             Self::Rule => "rule",
             Self::Decision => "decision",
             Self::Gotcha => "gotcha",
+            Self::Procedure => "procedure",
             Self::Fact => "fact",
         }
     }

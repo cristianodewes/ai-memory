@@ -6,6 +6,7 @@ use crate::config::Config;
 
 pub mod apply_shared;
 pub mod auth;
+pub mod auto_improve;
 pub mod backup;
 pub mod bootstrap;
 pub mod checkpoints;

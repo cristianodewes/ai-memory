@@ -70,6 +70,7 @@ match the intent to the tool. They do not need to name the tool.
 | "save context for the next session" / wrapping up / ending this session | `memory_handoff_begin` (session-end only; do **not** use for status/briefing; single-use handoff; terse summary; put detail in `open_questions` + `next_steps` bullets; pass `workspace` + `project` together only for a named sibling workspace/project) |
 | "discard that handoff" / "I created a handoff by mistake" | `memory_handoff_cancel` (requires exact `handoff_id` from `memory_handoff_begin`; marks it expired before the next session sees it) |
 | "consolidate this session" / "compile what we learned" (also runs on PreCompact; at session end only if `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set) | `memory_consolidate` |
+| "what did we learn from this session?" / "what memory should we add?" / explicit wrap-up learning review | `memory_auto_improve` (dry-run only; omit `session_id` for latest completed session; show proposals and evidence; do **not** apply/write them unless the user explicitly approves) |
 | "remember this permanently" / "save a note" / "add an annotation" / durable project knowledge | `memory_write_page` (write a wiki page; do **not** use handoff for permanent notes; put the title as a `# H1` on the first line of `body` and omit the `title` arg — ai-memory derives it from the H1) |
 | "read the page about X" / "show me the full content of Y" / "open the page on Z" | `memory_read_page` (full body; pass a query to search or `path` for a direct lookup; pass `workspace` + `project` together only for a named sibling workspace/project) |
 | "delete the page X" / "remove that note" | `memory_delete_page` (by exact `path`; idempotent; pass `workspace` + `project` together only for a named sibling workspace/project) |
@@ -102,12 +103,41 @@ match outside the snippet window). To read the whole page, use
 full body; add `workspace` + `project` together only when the user names
 a sibling workspace/project).
 
+### Use Retrieved Memory As Operating Guidance
+
+When `memory_query` or `memory_recent` returns `_rules/`, `gotchas/`,
+`procedures/`, or `decisions/` pages that match the current task, treat
+them as actionable context, not trivia:
+
+- Read full pages with `memory_read_page` when the snippet looks relevant.
+- Apply `_rules/` as constraints.
+- Check `gotchas/` as preflight warnings before editing the same subsystem.
+- Follow `procedures/` as checklists for releases, PR reviews, deploys,
+  migrations, and other repeatable workflows.
+- Use `decisions/` as prior architecture unless the user explicitly asks
+  to revisit them.
+
+Before non-trivial coding, debugging, deployment, release, auth, scope,
+migration, PR-review, or data-preservation work, search memory for the
+subsystem and task type first. If the first query is thin, broaden or
+query specific error/subsystem terms before designing a fix.
+
+### Learning Review
+
+`memory_auto_improve` is a dry-run learning reviewer. Use it when the
+user asks what durable lessons this session suggests, or at explicit
+wrap-up when reviewing proposed memory would be useful. It returns
+proposed wiki edits with evidence and never writes pages or pending
+proposals. Do not apply proposals with `memory_write_page` unless the
+user explicitly approves.
+
 ### When you write a project rule, write it here
 
 If you're about to write a durable project rule ("always X", "never
-Y", "all PRs must …"), this rules file (CLAUDE.md for Claude Code;
-AGENTS.md for Codex / OpenCode / Cursor / Gemini CLI; whichever
-convention your agent uses) is where it belongs. ai-memory's lint
+Y", "all PRs must …"), write it in the project's canonical agent
+instruction file. Many projects use CLAUDE.md for Claude Code and
+AGENTS.md for Codex / OpenCode / Cursor / Gemini CLI, but if the
+project says one file is canonical, use that file. ai-memory's lint
 pass surfaces the same hint automatically when a `kind: rule` page
 lands in `_rules/`.
 
@@ -122,7 +152,8 @@ the latest binary's recommended copy:
   (Claude Code → `CLAUDE.md`; Codex / OpenCode / Cursor / Gemini →
   `AGENTS.md`), and uses its Write / Edit tool to land the block.
 - **From the CLI**: `ai-memory install-instructions` (defaults to
-  `CLAUDE.md`; pass `--target AGENTS.md` for non-Claude agents).
+  `CLAUDE.md`; pass `--target AGENTS.md` for non-Claude agents or
+  projects that use `AGENTS.md` as the canonical instruction file).
 
 Both are idempotent: re-runs replace the block bracketed by
 `<!-- ai-memory:start -->` / `<!-- ai-memory:end -->` markers

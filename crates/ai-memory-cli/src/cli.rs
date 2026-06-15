@@ -79,6 +79,8 @@ pub enum Command {
     ForgetSweep(ForgetSweepArgs),
     /// Run the M8 lint pass (stale / duplicates + optional LLM contradiction).
     Lint(LintArgs),
+    /// Dry-run an optional auto-improvement review for one completed session.
+    AutoImprove(AutoImproveArgs),
     /// Compute + store embeddings for every latest page (M9).
     Embed(EmbedArgs),
     /// Generate a random hex bearer token for AI_MEMORY_AUTH_TOKEN.
@@ -852,6 +854,45 @@ pub struct LintArgs {
     pub project: Option<String>,
 }
 
+/// Arguments for `auto-improve`.
+#[derive(Debug, Args)]
+pub struct AutoImproveArgs {
+    /// Required for now. Staging/apply will ship after pending proposal storage.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Completed session UUID to review.
+    #[arg(long)]
+    pub session_id: String,
+    /// Workspace name. Defaults to `default`.
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub workspace: String,
+    /// Project name. When omitted, auto-derived from the basename of
+    /// the current git repo root (or CWD if no git repo).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Override `[auto_improve].min_observations` for this run.
+    #[arg(long)]
+    pub min_observations: Option<usize>,
+    /// Override `[auto_improve].min_session_duration_secs` for this run.
+    #[arg(long)]
+    pub min_session_duration_secs: Option<u64>,
+    /// Override `[auto_improve].min_confidence` for this run.
+    #[arg(long)]
+    pub min_confidence: Option<f32>,
+    /// Override `[auto_improve].max_input_tokens` for this run.
+    #[arg(long)]
+    pub max_input_tokens: Option<usize>,
+    /// Override `[auto_improve].max_proposals_per_run` for this run.
+    #[arg(long)]
+    pub max_proposals: Option<usize>,
+    /// Include raw fallback context when the reviewer supports it.
+    #[arg(long)]
+    pub include_raw_fallback: bool,
+    /// Emit only the machine-readable JSON report.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Arguments for `llm-test`.
 #[derive(Debug, Args)]
 pub struct LlmTestArgs {
@@ -1150,6 +1191,28 @@ mod tests {
             panic!("expected write-page command");
         };
         assert_eq!(args.project.as_deref(), Some("explicit"));
+    }
+
+    #[test]
+    fn auto_improve_dry_run_parses_required_session() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "auto-improve",
+            "--dry-run",
+            "--session-id",
+            "00000000-0000-0000-0000-000000000000",
+            "--max-proposals",
+            "2",
+        ])
+        .expect("auto-improve dry-run parses");
+
+        let Command::AutoImprove(args) = cli.command else {
+            panic!("expected auto-improve command");
+        };
+        assert!(args.dry_run);
+        assert_eq!(args.session_id, "00000000-0000-0000-0000-000000000000");
+        assert_eq!(args.max_proposals, Some(2));
+        assert_eq!(args.project, None);
     }
 
     #[test]
