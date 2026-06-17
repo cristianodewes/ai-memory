@@ -14,12 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (which, under the default basename strategy, was always), so opening a
   session in a broad ancestor such as `$HOME` created a row that
   prefix-matched every project nested beneath it and captured their unscoped
-  lookups. `repo_path` is now the git working directory containing the cwd,
-  or unset when the cwd is not inside a git repo, never the bare cwd. A
-  read-time guard additionally refuses to prefix-match a stored `repo_path`
-  equal to the operator's `$HOME`, and `ai-memory serve` heals existing
-  installs on startup by clearing any `repo_path` equal to `$HOME` or the
-  filesystem root. (issue #103)
+  lookups. A project's `repo_path` is now the git working-tree root, or unset
+  when the cwd is not inside a git repo, never the bare cwd; under the
+  default basename strategy it is recorded only when the cwd is the
+  repository root, never a subdirectory. A read-time guard additionally
+  refuses to prefix-match a stored `repo_path` equal to the operator's
+  `$HOME`, and `ai-memory serve` heals existing installs on startup by
+  clearing any `repo_path` that is not a real git working-tree root (such as
+  a legacy `~/projects` or `/work` catch-all), not only `$HOME` and the
+  filesystem root, while leaving paths it cannot see locally (a remote or
+  multi-user client path, or an unmounted drive) untouched. (issue #103)
 
 ## [1.1.0] - 2026-06-16
 
