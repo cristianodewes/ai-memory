@@ -13,6 +13,10 @@ static TAILWIND_CSS: &str = include_str!(env!("AI_MEMORY_WEB_TAILWIND_CSS"));
 /// Logo (PNG), embedded at compile time from `docs/logo.png`.
 static LOGO: &[u8] = include_bytes!("../../../../docs/logo.png");
 
+/// Folder-scoped chat client, embedded at compile time. Plain
+/// dependency-free JS so it runs with no build step.
+static CHAT_JS: &str = include_str!("../../static/chat.js");
+
 /// `GET /static/tailwind.css`
 pub(crate) async fn tailwind_css() -> impl IntoResponse {
     let mut headers = HeaderMap::new();
@@ -21,6 +25,16 @@ pub(crate) async fn tailwind_css() -> impl IntoResponse {
         HeaderValue::from_static("text/css; charset=utf-8"),
     );
     (StatusCode::OK, headers, TAILWIND_CSS)
+}
+
+/// `GET /static/chat.js`
+pub(crate) async fn chat_js() -> impl IntoResponse {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/javascript; charset=utf-8"),
+    );
+    (StatusCode::OK, headers, CHAT_JS)
 }
 
 /// `GET /static/logo.png`

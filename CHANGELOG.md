@@ -24,6 +24,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default, receives proposal JSON on stdin, fails closed on command/timeout/JSON
   errors or insufficient score delta, and records eval failures as rejected
   candidates without running from hook paths.
+- Folder-scoped chat in the built-in `/web` browser. Each folder in a
+  project's page tree — and the project as a whole — now has a
+  "Conversar" button that opens a chat with the server's configured LLM,
+  grounded in that folder's pages **and all its sub-folders**. Context is
+  assembled hybrid-style: an outline of every page under the prefix plus
+  the full bodies of the pages most relevant to the question, ranked by
+  embedding similarity (cosine over stored page vectors) with a BM25
+  fallback when no compatible embeddings exist. The chat is read-only —
+  it never mutates the wiki — and is available only when an LLM provider
+  is configured (`AI_MEMORY_LLM_PROVIDER`); otherwise the UI hides the
+  affordance and `POST /w/{workspace}/{project}/chat` returns `503`. It
+  runs under the existing `/web` auth posture (no new port or token). The
+  chat is reachable from the project list (per project card), the project
+  page (per folder or the whole project), and any page view (scoped to
+  that page's folder); assistant replies render as Markdown (fenced code
+  blocks, lists, inline code, emphasis) via a small dependency-free,
+  HTML-escaping renderer. From the home page an "all projects" button
+  opens a read-only chat grounded in every project. Within a project
+  chat the model can also modify memory: `create`/`edit` are applied
+  immediately through the sanitized wiki write path (so git history and
+  the SQLite index stay consistent), while `delete` is deferred and
+  requires an explicit confirmation click in the UI
+  (`POST /w/{workspace}/{project}/chat/delete`). The read-only JSON
+  `/api/v1` surface is unchanged and does not expose chat.
 
 ### Fixed
 - Auto-improvement eval gates now apply timeouts to the full child interaction,
@@ -35,7 +59,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   aliases still prefix-match later events into the same project.
 - Updated `git2` to the patched 0.21 line to clear new RustSec unsoundness
   advisories in libgit2 bindings.
-<<<<<<< HEAD
 - Native Claude Code hooks now capture array-shaped `tool_response` content and
   recognize the native `user-prompt-submit` event token, restoring prompt text
   and tool output bodies for native installs.
@@ -46,6 +69,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retrying on every drain boundary with no operator signal until the 7-day
   age-out pruned it. The warning is sanitized and carries no path (a raw spool
   path can be a Windows verbatim `\\?\…` path).
+- `openai-oauth` (ChatGPT/Codex Responses API) now serializes assistant turns
+  in a multi-turn conversation with content type `output_text` instead of
+  `input_text`. The API rejects `input_text` on an assistant turn with
+  `400 invalid_value` (`input[n].content[0]`), which made every second turn of
+  the folder-scoped web chat fail once the history carried a prior reply.
+  Single-shot callers (consolidation, auto-improve, PreCompact) only ever sent
+  one user turn, so the bug surfaced only with multi-turn chat.
 
 ## [1.1.3] - 2026-06-20
 

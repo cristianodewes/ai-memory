@@ -35,8 +35,11 @@ pub(crate) async fn handler(
         })
         .collect();
 
-    let html = ProjectsView { projects }
-        .render()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let html = ProjectsView {
+        chat_enabled: state.llm.is_some(),
+        projects,
+    }
+    .render()
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Html(html))
 }

@@ -3,11 +3,12 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::get;
+use axum::routing::{get, post};
 
 use crate::state::WebState;
 
 mod api;
+mod chat;
 mod index;
 mod page;
 mod project;
@@ -20,8 +21,15 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
         .route("/", get(index::handler))
         .route("/w/{workspace}/{project}", get(project::handler))
         .route("/w/{workspace}/{project}/p/{*path}", get(page::handler))
+        .route("/w/{workspace}/{project}/chat", post(chat::handler))
+        .route(
+            "/w/{workspace}/{project}/chat/delete",
+            post(chat::delete_handler),
+        )
+        .route("/chat", post(chat::global_handler))
         .route("/search", get(search::handler))
         .route("/static/tailwind.css", get(statics::tailwind_css))
+        .route("/static/chat.js", get(statics::chat_js))
         .route("/static/logo.png", get(statics::logo))
         .with_state(state)
 }

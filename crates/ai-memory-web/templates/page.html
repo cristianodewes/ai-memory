@@ -12,7 +12,17 @@
 </nav>
 
 <article class="max-w-3xl">
-  <h1 class="text-3xl font-bold text-slate-900 dark:text-slate-100 mb-3">{{ title }}</h1>
+  <div class="flex items-start justify-between gap-4 mb-3">
+    <h1 class="text-3xl font-bold text-slate-900 dark:text-slate-100">{{ title }}</h1>
+    {% if chat_enabled %}
+    <button type="button"
+            data-chat-workspace="{{ workspace }}" data-chat-project="{{ project }}" data-chat-folder="{{ chat_folder }}"
+            title="Chat about this folder's memories"
+            class="shrink-0 inline-flex items-center gap-1 rounded-md border border-slate-300 dark:border-slate-700 px-3 py-1.5 text-sm font-medium text-slate-700 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400">
+      💬 Chat
+    </button>
+    {% endif %}
+  </div>
 
   <!-- Metadata row -->
   <div class="flex flex-wrap items-center gap-2 mb-6 text-xs text-slate-500 dark:text-slate-400">
@@ -70,4 +80,8 @@
     {{ body_html|safe }}
   </div>
 </article>
+
+{% if chat_enabled %}
+<script src="static/chat.js" defer></script>
+{% endif %}
 {% endblock %}

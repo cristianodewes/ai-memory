@@ -48,7 +48,17 @@ pub(crate) async fn handler(
     }
     let folders: Vec<Folder> = folder_map
         .into_iter()
-        .map(|(name, pages)| Folder { name, pages })
+        .map(|(name, pages)| {
+            // The synthetic "(root)" group has no real path prefix, so it
+            // gets no per-folder chat button (the project-wide chat covers
+            // those root-level pages).
+            let chat_folder = (name != "(root)").then(|| name.clone());
+            Folder {
+                name,
+                chat_folder,
+                pages,
+            }
+        })
         .collect();
 
     // Recent pages: sort by updated_at desc, take 20.
@@ -69,6 +79,7 @@ pub(crate) async fn handler(
     let html = ProjectView {
         workspace,
         project,
+        chat_enabled: state.llm.is_some(),
         folders,
         recent,
     }

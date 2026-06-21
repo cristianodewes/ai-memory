@@ -116,6 +116,9 @@ pub(crate) struct ProjectCard {
 #[derive(Template)]
 #[template(path = "projects.html")]
 pub(crate) struct ProjectsView {
+    /// Whether the folder-scoped chat is available (an LLM provider is
+    /// configured). Gates the per-card chat button.
+    pub chat_enabled: bool,
     /// All project cards, sorted by most recently active first.
     pub projects: Vec<ProjectCard>,
 }
@@ -142,6 +145,10 @@ pub(crate) struct PageRow {
 pub(crate) struct Folder {
     /// Folder name (first path segment, without trailing slash).
     pub name: String,
+    /// Folder prefix to scope a chat to, or `None` for the synthetic
+    /// `(root)` group (which has no real path prefix — the
+    /// project-wide chat covers it instead).
+    pub chat_folder: Option<String>,
     /// Pages inside this folder.
     pub pages: Vec<PageRow>,
 }
@@ -154,6 +161,9 @@ pub(crate) struct ProjectView {
     pub workspace: String,
     /// Project name.
     pub project: String,
+    /// Whether the folder-scoped chat is available (an LLM provider is
+    /// configured). Gates every chat affordance in the template.
+    pub chat_enabled: bool,
     /// Sidebar folder tree.
     pub folders: Vec<Folder>,
     /// N most-recent pages for the right column.
@@ -206,6 +216,13 @@ pub(crate) struct PageView {
     /// Optional email rendered as a `mailto:` link after the username.
     /// Empty when not set on the user row.
     pub author_email: String,
+    /// Whether the folder-scoped chat is available (an LLM provider is
+    /// configured). Gates the page-view chat button.
+    pub chat_enabled: bool,
+    /// Folder prefix to scope this page's chat to — the page's top-level
+    /// folder (first path segment), or empty for a root-level page (whole
+    /// project).
+    pub chat_folder: String,
 }
 
 // ---------------------------------------------------------------------------

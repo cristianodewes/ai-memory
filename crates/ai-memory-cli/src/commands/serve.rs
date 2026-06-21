@@ -292,7 +292,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 writer: store.writer.clone(),
                 reader: store.reader.clone(),
                 wiki: wiki.clone(),
-                llm: admin_llm,
+                llm: admin_llm.clone(),
                 auto_improve_require_approval: config.auto_improve.require_approval,
                 auto_improve_review_config: auto_improve_review_config_from_settings(
                     &config.auto_improve,
@@ -385,6 +385,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     base_href: &base_href,
                     base_path: &base_path,
                 },
+                (admin_llm, embedder.clone()),
             )?;
             let router = apply_http_layers(router, auth_state, config.allowed_hosts.clone());
             // Host the entire surface under the configured base path. Empty
@@ -1499,6 +1500,12 @@ mod web_base_tests {
 /// keeps `mount_web_router` and its helpers under clippy's
 /// `too_many_arguments` threshold without `#[allow]` papering over
 /// the call shape.
+/// `(llm, embedder)` handles that power the folder-scoped web chat,
+/// bundled so `mount_web_router` / `mount_builtin_browser` stay under
+/// clippy's argument-count limit. Both are `None` when the server has
+/// no LLM (chat disabled) or no embedder (BM25-only chat context).
+type WebChatProviders = (Option<Arc<dyn LlmProvider>>, Option<Arc<dyn Embedder>>);
+
 pub(crate) struct WebMountSpec<'a> {
     pub web_ui_dir: Option<&'a Path>,
     pub cors_origins: &'a [String],
@@ -1518,6 +1525,7 @@ fn mount_web_router(
     reader: ReaderPool,
     wiki: Wiki,
     spec: WebMountSpec<'_>,
+    chat: WebChatProviders,
 ) -> Result<axum::Router> {
     if !enable_web {
         return Ok(router);
@@ -1549,6 +1557,7 @@ fn mount_web_router(
         &slug,
         spec.base_href,
         mount,
+        chat,
     ))
 }
 
@@ -1630,12 +1639,14 @@ fn mount_builtin_browser(
     slug: &str,
     base_href: &str,
     mount: &str,
+    chat: WebChatProviders,
 ) -> axum::Router {
     // The built-in browser emits RELATIVE asset/link URLs (`static/…`,
     // `w/…`, `search`, `.`). Inject a `<base href>` into every HTML
     // response so they resolve under `{base_path}{web_slug}/` — the
     // same anchoring the custom SPA gets via its injected index.
-    let web_router = ai_memory_web::router(reader, wiki).layer(
+    let (llm, embedder) = chat;
+    let web_router = ai_memory_web::router(reader, wiki, llm, embedder).layer(
         axum::middleware::from_fn_with_state(Arc::new(base_href.to_string()), inject_web_base_href),
     );
     info!(mount, base_href, "read-only wiki browser mounted");
@@ -1934,6 +1945,7 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
             },
+            (None, None),
         )
         .unwrap();
         let router = apply_http_layers(
@@ -1979,6 +1991,7 @@ mod tests {
                 base_href: &base_href,
                 base_path: &base,
             },
+            (None, None),
         )
         .unwrap();
         let router = if base.is_empty() {
@@ -2265,6 +2278,7 @@ mod tests {
                 base_href: &base_href,
                 base_path: &base,
             },
+            (None, None),
         )
         .unwrap();
         let router = axum::Router::new().nest(&base, router);
@@ -2344,6 +2358,7 @@ mod tests {
                 base_href: &base_href,
                 base_path: "",
             },
+            (None, None),
         )
         .unwrap();
 
@@ -2402,6 +2417,7 @@ mod tests {
                 base_href: &base_href,
                 base_path: &base,
             },
+            (None, None),
         )
         .unwrap();
         let router = axum::Router::new().nest(&base, router);
@@ -2705,6 +2721,7 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
             },
+            (None, None),
         )
         .unwrap();
         // No auth layer so we can reach /api/v1 directly.
@@ -2760,6 +2777,7 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
             },
+            (None, None),
         )
         .unwrap();
         let resp = router
@@ -2804,6 +2822,7 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
             },
+            (None, None),
         )
         .unwrap();
         // /web is a non-api route; sending an Origin header must not trigger CORS.

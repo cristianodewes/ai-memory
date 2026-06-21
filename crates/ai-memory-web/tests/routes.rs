@@ -3,7 +3,10 @@
 //! Spins up a `Store` + `Wiki` in a tempdir, seeds two pages, builds
 //! the router, and exercises each route via `tower::ServiceExt::oneshot`.
 
+use std::sync::{Arc, Mutex};
+
 use ai_memory_core::{AgentKind, NewHandoff, NewPage, PagePath, Tier};
+use ai_memory_llm::{ChatRequest, ChatResponse, LlmProvider, LlmResult};
 use ai_memory_store::Store;
 use ai_memory_web::{api_router, router};
 use ai_memory_wiki::{Wiki, WritePageRequest};
@@ -12,6 +15,60 @@ use axum::http::{Method, Request, StatusCode, header};
 use serde_json::Value;
 use tempfile::TempDir;
 use tower::ServiceExt;
+
+/// Stub provider for the chat tests: records the system prompt it was
+/// handed (so tests can assert context) and returns canned output. The
+/// plain path returns "stub reply" (used by the read-only global chat);
+/// the structured path returns a configurable `ChatTurn` JSON (used by
+/// the writable project chat).
+struct StubLlm {
+    seen_system: Arc<Mutex<Option<String>>>,
+    structured: Value,
+}
+
+impl StubLlm {
+    fn new(seen_system: Arc<Mutex<Option<String>>>, structured: Value) -> Self {
+        Self {
+            seen_system,
+            structured,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for StubLlm {
+    fn name(&self) -> &'static str {
+        "stub"
+    }
+    fn model(&self) -> &str {
+        "stub-model"
+    }
+    async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
+        *self.seen_system.lock().unwrap() = request.system.clone();
+        Ok(ChatResponse {
+            text: "stub reply".to_owned(),
+            usage: None,
+            model: "stub-model".to_owned(),
+        })
+    }
+    async fn complete_structured_raw(
+        &self,
+        request: ChatRequest,
+        _schema: serde_json::Value,
+    ) -> LlmResult<serde_json::Value> {
+        *self.seen_system.lock().unwrap() = request.system.clone();
+        Ok(self.structured.clone())
+    }
+}
+
+fn post_chat(uri: &str, payload: &Value) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(payload.to_string()))
+        .unwrap()
+}
 
 async fn setup() -> (TempDir, Store, Wiki) {
     let tmp = TempDir::new().unwrap();
@@ -81,7 +138,7 @@ async fn smoke_index_returns_200() {
         .await
         .unwrap();
 
-    let app = router(store.reader.clone(), wiki.clone());
+    let app = router(store.reader.clone(), wiki.clone(), None, None);
     let req = Request::builder().uri("/").body(Body::empty()).unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -121,7 +178,7 @@ async fn smoke_project_page_returns_200() {
         .await
         .unwrap();
 
-    let app = router(store.reader.clone(), wiki.clone());
+    let app = router(store.reader.clone(), wiki.clone(), None, None);
     let req = Request::builder()
         .uri("/w/default/scratch")
         .body(Body::empty())
@@ -157,7 +214,7 @@ async fn smoke_page_view_returns_200() {
         .await
         .unwrap();
 
-    let app = router(store.reader.clone(), wiki.clone());
+    let app = router(store.reader.clone(), wiki.clone(), None, None);
     let req = Request::builder()
         .uri("/w/default/scratch/p/foo.md")
         .body(Body::empty())
@@ -199,7 +256,7 @@ async fn web_page_view_omits_author_chrome_for_anonymous_pages() {
         .await
         .unwrap();
 
-    let app = router(store.reader.clone(), wiki.clone());
+    let app = router(store.reader.clone(), wiki.clone(), None, None);
     let resp = app
         .oneshot(
             Request::builder()
@@ -258,7 +315,7 @@ async fn web_page_view_renders_author_chip_for_attributed_pages() {
     };
     wiki.write_page(req).await.unwrap();
 
-    let app = router(store.reader.clone(), wiki.clone());
+    let app = router(store.reader.clone(), wiki.clone(), None, None);
     let resp = app
         .oneshot(
             Request::builder()
@@ -314,7 +371,7 @@ async fn smoke_search_returns_200() {
         .await
         .unwrap();
 
-    let app = router(store.reader.clone(), wiki.clone());
+    let app = router(store.reader.clone(), wiki.clone(), None, None);
     let req = Request::builder()
         .uri("/search?q=unique_term_xyz_abc")
         .body(Body::empty())
@@ -357,7 +414,7 @@ async fn web_links_percent_encode_route_segments() {
         .await
         .unwrap();
 
-    let app = router(store.reader.clone(), wiki.clone());
+    let app = router(store.reader.clone(), wiki.clone(), None, None);
     let req = Request::builder()
         .uri("/w/default/scratch%20%231")
         .body(Body::empty())
@@ -386,7 +443,7 @@ async fn smoke_page_not_found_returns_404() {
         .await
         .unwrap();
 
-    let app = router(store.reader.clone(), wiki.clone());
+    let app = router(store.reader.clone(), wiki.clone(), None, None);
     let req = Request::builder()
         .uri("/w/default/scratch/p/does-not-exist.md")
         .body(Body::empty())
@@ -2011,4 +2068,329 @@ async fn api_v1_etag_differs_between_anonymous_and_attributed_writes() {
         "ETag must invalidate when author changes — even when body is identical \
          (would otherwise let stale caches hide attribution flips)"
     );
+}
+
+// ── Folder-scoped chat ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn chat_scopes_context_to_folder_and_returns_reply() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(
+        ws,
+        proj,
+        "decisions/auth.md",
+        "We chose OAuth for login.",
+    ))
+    .await
+    .unwrap();
+    wiki.write_page(wiki_req(
+        ws,
+        proj,
+        "decisions/db.md",
+        "We use SQLite as the store.",
+    ))
+    .await
+    .unwrap();
+    wiki.write_page(wiki_req(
+        ws,
+        proj,
+        "gotchas/win.md",
+        "Windows path canonicalization differs.",
+    ))
+    .await
+    .unwrap();
+
+    let seen = Arc::new(Mutex::new(None));
+    let llm: Arc<dyn LlmProvider> = Arc::new(StubLlm::new(
+        seen.clone(),
+        serde_json::json!({"reply": "stub reply", "actions": []}),
+    ));
+    let app = router(store.reader.clone(), wiki.clone(), Some(llm), None);
+
+    let payload = serde_json::json!({
+        "folder": "decisions",
+        "messages": [{"role": "user", "content": "what did we decide about auth?"}],
+    });
+    let resp = app
+        .oneshot(post_chat("/w/default/scratch/chat", &payload))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["reply"], "stub reply");
+    assert_eq!(v["model"], "stub-model");
+
+    let system = seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("provider should have been called with a system prompt");
+    assert!(
+        system.contains("decisions/auth.md"),
+        "outline must include the in-scope page"
+    );
+    assert!(
+        system.contains("decisions/db.md"),
+        "outline must include the sibling in-scope page"
+    );
+    assert!(
+        !system.contains("gotchas/win.md"),
+        "an out-of-scope folder must not leak into the chat context"
+    );
+}
+
+#[tokio::test]
+async fn chat_returns_503_when_no_llm_configured() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(ws, proj, "decisions/auth.md", "OAuth"))
+        .await
+        .unwrap();
+
+    // No LLM provider → chat is disabled.
+    let app = router(store.reader.clone(), wiki.clone(), None, None);
+    let payload = serde_json::json!({
+        "folder": "decisions",
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    let resp = app
+        .oneshot(post_chat("/w/default/scratch/chat", &payload))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn chat_returns_404_when_folder_has_no_pages() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(ws, proj, "decisions/auth.md", "OAuth"))
+        .await
+        .unwrap();
+
+    let seen = Arc::new(Mutex::new(None));
+    let llm: Arc<dyn LlmProvider> = Arc::new(StubLlm::new(
+        seen.clone(),
+        serde_json::json!({"reply": "stub reply", "actions": []}),
+    ));
+    let app = router(store.reader.clone(), wiki.clone(), Some(llm), None);
+    let payload = serde_json::json!({
+        "folder": "nonexistent",
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    let resp = app
+        .oneshot(post_chat("/w/default/scratch/chat", &payload))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(
+        seen.lock().unwrap().is_none(),
+        "the provider must not be called when there is no in-scope context"
+    );
+}
+
+#[tokio::test]
+async fn chat_create_action_applies_page_immediately() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    // A pre-existing page so the project scope is non-empty.
+    wiki.write_page(wiki_req(ws, proj, "notes/seed.md", "seed"))
+        .await
+        .unwrap();
+
+    let structured = serde_json::json!({
+        "reply": "Criei a página.",
+        "actions": [{
+            "op": "create",
+            "path": "notes/created-by-llm.md",
+            "title": "By LLM",
+            "body": "# By LLM\n\nconteúdo gerado",
+            "reason": "o usuário pediu"
+        }]
+    });
+    let llm: Arc<dyn LlmProvider> = Arc::new(StubLlm::new(Arc::new(Mutex::new(None)), structured));
+    let app = router(store.reader.clone(), wiki.clone(), Some(llm), None);
+
+    let payload = serde_json::json!({
+        "folder": "",
+        "messages": [{"role": "user", "content": "crie uma nota"}],
+    });
+    let resp = app
+        .oneshot(post_chat("/w/default/scratch/chat", &payload))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["applied"][0]["op"], "create");
+    assert_eq!(v["applied"][0]["ok"], true);
+    assert_eq!(v["applied"][0]["path"], "notes/created-by-llm.md");
+
+    // The create must have persisted through the wiki write path.
+    let meta = store
+        .reader
+        .page_meta("default", "scratch", "notes/created-by-llm.md")
+        .await
+        .unwrap();
+    assert!(meta.is_some(), "create action must persist the page");
+}
+
+#[tokio::test]
+async fn chat_delete_action_is_deferred_then_confirmed() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(ws, proj, "gotchas/old.md", "obsolete"))
+        .await
+        .unwrap();
+
+    let structured = serde_json::json!({
+        "reply": "Proponho deletar.",
+        "actions": [{
+            "op": "delete",
+            "path": "gotchas/old.md",
+            "title": "",
+            "body": "",
+            "reason": "obsoleto"
+        }]
+    });
+    let llm: Arc<dyn LlmProvider> = Arc::new(StubLlm::new(Arc::new(Mutex::new(None)), structured));
+    let app = router(store.reader.clone(), wiki.clone(), Some(llm), None);
+
+    // Turn 1: delete must be DEFERRED, not applied.
+    let payload = serde_json::json!({
+        "folder": "gotchas",
+        "messages": [{"role": "user", "content": "delete a antiga"}],
+    });
+    let resp = app
+        .oneshot(post_chat("/w/default/scratch/chat", &payload))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["pending_deletes"][0]["path"], "gotchas/old.md");
+    assert!(
+        v.get("applied").is_none(),
+        "a delete must not auto-apply (no applied actions)"
+    );
+    assert!(
+        store
+            .reader
+            .page_meta("default", "scratch", "gotchas/old.md")
+            .await
+            .unwrap()
+            .is_some(),
+        "page must still exist before confirmation"
+    );
+
+    // Confirm: the page is actually removed.
+    let llm2: Arc<dyn LlmProvider> = Arc::new(StubLlm::new(
+        Arc::new(Mutex::new(None)),
+        serde_json::json!({}),
+    ));
+    let app2 = router(store.reader.clone(), wiki.clone(), Some(llm2), None);
+    let del = serde_json::json!({ "path": "gotchas/old.md" });
+    let resp = app2
+        .oneshot(post_chat("/w/default/scratch/chat/delete", &del))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        store
+            .reader
+            .page_meta("default", "scratch", "gotchas/old.md")
+            .await
+            .unwrap()
+            .is_none(),
+        "confirmed delete must remove the page"
+    );
+}
+
+#[tokio::test]
+async fn global_chat_answers_across_projects() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(ws, proj, "notes/a.md", "alpha content"))
+        .await
+        .unwrap();
+
+    let llm: Arc<dyn LlmProvider> = Arc::new(StubLlm::new(
+        Arc::new(Mutex::new(None)),
+        serde_json::json!({}),
+    ));
+    let app = router(store.reader.clone(), wiki.clone(), Some(llm), None);
+
+    let payload =
+        serde_json::json!({ "messages": [{"role": "user", "content": "o que sabemos?"}] });
+    let resp = app.oneshot(post_chat("/chat", &payload)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["reply"], "stub reply");
+    assert_eq!(v["model"], "stub-model");
 }

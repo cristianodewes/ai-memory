@@ -226,13 +226,16 @@ name = "ai-memory-web"
 version = "1.1.3"
 dependencies = [
  "ai-memory-core",
+ "ai-memory-llm",
  "ai-memory-store",
  "ai-memory-wiki",
  "anyhow",
  "askama",
+ "async-trait",
  "axum",
  "jiff",
  "pulldown-cmark",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",

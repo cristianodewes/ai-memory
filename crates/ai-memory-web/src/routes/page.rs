@@ -63,6 +63,13 @@ pub(crate) async fn handler(
         },
     );
 
+    // Scope this page's chat to its top-level folder (first path segment),
+    // or the whole project for a root-level page.
+    let chat_folder = path
+        .split_once('/')
+        .map(|(folder, _)| folder.to_owned())
+        .unwrap_or_default();
+
     match (PageView {
         workspace,
         project,
@@ -80,6 +87,8 @@ pub(crate) async fn handler(
         author_username,
         author_name,
         author_email,
+        chat_enabled: state.llm.is_some(),
+        chat_folder,
     }
     .render())
     {

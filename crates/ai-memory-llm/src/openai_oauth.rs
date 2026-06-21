@@ -336,15 +336,23 @@ fn build_request<'a>(
     let input = request
         .messages
         .iter()
-        .map(|msg| CodexInputMessage {
-            role: match msg.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-            },
-            content: vec![CodexInputContent {
-                kind: "input_text",
-                text: &msg.content,
-            }],
+        .map(|msg| {
+            // The Responses API types each content part by its producer:
+            // user/input turns use `input_text`, assistant/output turns use
+            // `output_text`. Tagging an assistant turn as `input_text` (which
+            // happens once a multi-turn history carries a prior reply) is
+            // rejected with `400 invalid_value` on `input[n].content[0]`.
+            let (role, kind) = match msg.role {
+                Role::User => ("user", "input_text"),
+                Role::Assistant => ("assistant", "output_text"),
+            };
+            CodexInputMessage {
+                role,
+                content: vec![CodexInputContent {
+                    kind,
+                    text: &msg.content,
+                }],
+            }
         })
         .collect();
     CodexResponsesRequest {
@@ -759,6 +767,40 @@ mod tests {
         assert!(value.get("temperature").is_none());
         assert_eq!(value["store"], false);
         assert_eq!(value["stream"], true);
+    }
+
+    #[test]
+    fn codex_request_types_assistant_turns_as_output_text() {
+        // Multi-turn history: the assistant turn MUST serialize as
+        // `output_text`, not `input_text`, or the Responses API rejects the
+        // request with `400 invalid_value` on `input[1].content[0]` (the
+        // bug that made every second chat turn fail).
+        let request = ChatRequest {
+            system: None,
+            messages: vec![
+                crate::types::ChatMessage {
+                    role: Role::User,
+                    content: "first question".into(),
+                },
+                crate::types::ChatMessage {
+                    role: Role::Assistant,
+                    content: "first answer".into(),
+                },
+                crate::types::ChatMessage {
+                    role: Role::User,
+                    content: "follow-up".into(),
+                },
+            ],
+            temperature: None,
+            max_tokens: 256,
+        };
+        let value = serde_json::to_value(build_request("gpt-5.5", &request, None)).unwrap();
+        assert_eq!(value["input"][0]["role"], "user");
+        assert_eq!(value["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(value["input"][1]["role"], "assistant");
+        assert_eq!(value["input"][1]["content"][0]["type"], "output_text");
+        assert_eq!(value["input"][2]["role"], "user");
+        assert_eq!(value["input"][2]["content"][0]["type"], "input_text");
     }
 
     #[test]

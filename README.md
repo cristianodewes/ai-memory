@@ -75,9 +75,11 @@ priors are at the [bottom](#influences-and-prior-art).
   at session-end (or PreCompact), not retrieved over raw logs.
   Supersession chain + git-versioned markdown means you can
   time-travel with `ai-memory checkpoints`, `restore-page`, or raw `git log`.
-- **Built-in `/web` browser.** Read-only HTML UI for the wiki -
-  project list, folder tree, FTS5 search, markdown rendering, dark
-  mode. Mounted on the same axum server as MCP.
+- **Built-in `/web` browser.** HTML UI for the wiki - project list,
+  folder tree, FTS5 search, markdown rendering, dark mode - plus a
+  folder-scoped chat with the configured LLM (when one is set): open a
+  chat on any folder to discuss its pages and all their sub-folders.
+  Mounted on the same axum server as MCP.
 - **Multi-agent + multi-machine ready.** Supported clients: Claude
   Code, Codex, OpenCode, Cursor, Claude Desktop (via `mcp-remote`),
   Gemini CLI, Antigravity CLI, Grok Build CLI, OpenClaw, Oh My Pi / OMP
@@ -407,11 +409,13 @@ Useful entry points:
 - Ask "catch me up" for a prose digest of recent project activity.
 - Run `ai-memory bootstrap` once when adopting ai-memory in an existing
   project with months of history.
-- Start the server with `--enable-web` and visit `/web` for a read-only
-  browser view of the markdown wiki. `--enable-web` also mounts a
-  read-only JSON frontend API at `/api/v1` (workspaces, projects, pages,
-  recent, briefing, search) so custom web UIs can read the memory without
-  opening SQLite or wiki files directly:
+- Start the server with `--enable-web` and visit `/web` for a browser
+  view of the markdown wiki. When an LLM provider is configured, each
+  folder (and the project as a whole) offers a chat scoped to that
+  folder and its sub-folders, grounded in those pages. `--enable-web`
+  also mounts a read-only JSON frontend API at `/api/v1` (workspaces,
+  projects, pages, recent, briefing, search) so custom web UIs can read
+  the memory without opening SQLite or wiki files directly:
 
   ```text
   GET  /api/v1/workspaces
