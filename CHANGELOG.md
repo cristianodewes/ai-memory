@@ -46,8 +46,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   immediately through the sanitized wiki write path (so git history and
   the SQLite index stay consistent), while `delete` is deferred and
   requires an explicit confirmation click in the UI
-  (`POST /w/{workspace}/{project}/chat/delete`). The read-only JSON
-  `/api/v1` surface is unchanged and does not expose chat.
+  (`POST /w/{workspace}/{project}/chat/delete`). Works with any configured
+  LLM provider (Anthropic, OpenAI, OpenAI OAuth/Codex, GitHub Copilot,
+  Gemini, OpenAI-compatible) via the existing `LlmProvider` trait; the
+  write path uses structured output and degrades to a plain read-only
+  reply when a provider can't produce it. The read-only JSON `/api/v1`
+  surface is unchanged and does not expose chat.
 
 ### Fixed
 - Auto-improvement eval gates now apply timeouts to the full child interaction,

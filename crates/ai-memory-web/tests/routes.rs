@@ -2394,3 +2394,53 @@ async fn global_chat_answers_across_projects() {
     assert_eq!(v["reply"], "stub reply");
     assert_eq!(v["model"], "stub-model");
 }
+
+#[tokio::test]
+async fn chat_falls_back_to_plain_reply_when_structured_output_fails() {
+    // A provider whose structured output can't be parsed into a ChatTurn
+    // (e.g. a weak local OpenAI-compat model) must NOT hard-fail the project
+    // chat — it degrades to a plain read-only reply via complete().
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(ws, proj, "notes/seed.md", "seed"))
+        .await
+        .unwrap();
+
+    // Not a valid ChatTurn → complete_structured fails → fallback to complete().
+    let llm: Arc<dyn LlmProvider> = Arc::new(StubLlm::new(
+        Arc::new(Mutex::new(None)),
+        serde_json::json!({ "unexpected": true }),
+    ));
+    let app = router(store.reader.clone(), wiki.clone(), Some(llm), None);
+
+    let payload = serde_json::json!({
+        "folder": "",
+        "messages": [{"role": "user", "content": "what is here?"}],
+    });
+    let resp = app
+        .oneshot(post_chat("/w/default/scratch/chat", &payload))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        v["reply"], "stub reply",
+        "fallback must answer via complete()"
+    );
+    assert!(
+        v.get("applied").is_none(),
+        "fallback (read-only) mode performs no actions"
+    );
+}

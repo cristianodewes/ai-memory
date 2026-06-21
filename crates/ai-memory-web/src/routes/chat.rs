@@ -165,20 +165,41 @@ pub(crate) async fn handler(
     let (bodies, context_pages, context_truncated) =
         load_bodies(&state, workspace_id, project_id, &scoped, &ranked).await;
 
-    let system = build_system_prompt(&workspace, &project, &folder, &scoped, &bodies);
     let request = ChatRequest {
-        system: Some(system),
-        messages: turns,
+        system: Some(build_system_prompt(
+            &workspace, &project, &folder, &scoped, &bodies, true,
+        )),
+        messages: turns.clone(),
         max_tokens: MAX_COMPLETION_TOKENS,
         temperature: None,
     };
 
-    let turn: ChatTurn = complete_structured(llm.as_ref(), request)
-        .await
-        .map_err(|e| {
-            tracing::warn!(error = %e, "web chat: provider call failed");
-            json_error(StatusCode::BAD_GATEWAY, "the LLM provider call failed")
-        })?;
+    // The action path needs structured output. Every provider implements it,
+    // but a weak OpenAI-compatible model can emit malformed JSON; rather than
+    // hard-fail, degrade to a plain read-only reply so the chat still answers
+    // on any configured LLM (it just can't propose edits in that fallback).
+    let turn: ChatTurn = match complete_structured(llm.as_ref(), request).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "web chat: structured output failed; falling back to a read-only reply");
+            let fallback = ChatRequest {
+                system: Some(build_system_prompt(
+                    &workspace, &project, &folder, &scoped, &bodies, false,
+                )),
+                messages: turns,
+                max_tokens: MAX_COMPLETION_TOKENS,
+                temperature: None,
+            };
+            let resp = llm.complete(fallback).await.map_err(|e2| {
+                tracing::warn!(error = %e2, "web chat: provider call failed");
+                json_error(StatusCode::BAD_GATEWAY, "the LLM provider call failed")
+            })?;
+            ChatTurn {
+                reply: resp.text,
+                actions: Vec::new(),
+            }
+        }
+    };
 
     // Apply create/edit immediately; defer delete for confirmation.
     let mut applied = Vec::new();
@@ -584,6 +605,7 @@ fn build_system_prompt(
     folder: &str,
     scoped: &[PageSummary],
     bodies: &[BodySection],
+    writable: bool,
 ) -> String {
     use std::fmt::Write as _;
 
@@ -594,26 +616,36 @@ fn build_system_prompt(
     };
 
     let mut s = String::new();
-    let _ = write!(
-        s,
-        "You are a memory editor for the ai-memory wiki, working in {scope_label}, \
-         workspace \"{workspace}\". You have WRITE access to this project's pages and can \
-         change memory directly — you are NOT read-only.\n\n\
-         When the user asks you to add, update, correct, rename, or remove memory, perform \
-         it by returning entries in the `actions` array. Never reply that you cannot edit or \
-         that you are read-only — use the actions instead:\n\
-         - `create`: a new page. Set `path` (e.g. `decisions/foo.md`), `title`, and the full \
-         Markdown `body`.\n\
-         - `edit`: replace an existing page's entire body. Set `path`, `title`, and the \
-         complete new `body` (a full replacement, not a diff).\n\
-         - `delete`: remove a page. Set `path` and a `reason`; leave `title` and `body` empty.\n\
-         `create` and `edit` take effect immediately; `delete` is applied only after the user \
-         confirms in the UI, so explain the deletion in your `reply`. For a pure question \
-         (no change requested), return an empty `actions` array and answer in `reply`. Keep \
-         every `path` inside this project.\n\n\
-         Ground factual claims in the pages below and cite the page paths you rely on. Be \
-         concise; format `reply` with Markdown.\n\n"
-    );
+    if writable {
+        let _ = write!(
+            s,
+            "You are a memory editor for the ai-memory wiki, working in {scope_label}, \
+             workspace \"{workspace}\". You have WRITE access to this project's pages and can \
+             change memory directly — you are NOT read-only.\n\n\
+             When the user asks you to add, update, correct, rename, or remove memory, perform \
+             it by returning entries in the `actions` array. Never reply that you cannot edit or \
+             that you are read-only — use the actions instead:\n\
+             - `create`: a new page. Set `path` (e.g. `decisions/foo.md`), `title`, and the full \
+             Markdown `body`.\n\
+             - `edit`: replace an existing page's entire body. Set `path`, `title`, and the \
+             complete new `body` (a full replacement, not a diff).\n\
+             - `delete`: remove a page. Set `path` and a `reason`; leave `title` and `body` empty.\n\
+             `create` and `edit` take effect immediately; `delete` is applied only after the user \
+             confirms in the UI, so explain the deletion in your `reply`. For a pure question \
+             (no change requested), return an empty `actions` array and answer in `reply`. Keep \
+             every `path` inside this project.\n\n\
+             Ground factual claims in the pages below and cite the page paths you rely on. Be \
+             concise; format `reply` with Markdown.\n\n"
+        );
+    } else {
+        let _ = write!(
+            s,
+            "You are a memory analyst for the ai-memory wiki, working in {scope_label}, \
+             workspace \"{workspace}\". Ground every claim in the pages below and cite the \
+             page paths you rely on. If the pages do not answer the question, say so plainly. \
+             Be concise; format with Markdown.\n\n"
+        );
+    }
 
     s.push_str("# Pages in scope (outline)\n");
     for p in scoped.iter().take(MAX_OUTLINE_PAGES) {
