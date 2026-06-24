@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `ai-memory recall-stats [--days N] [--json]` and `GET /admin/recall-stats?days=N`
+  report how often agents READ memory back (`memory_query` / `read_page` /
+  `recent` / `briefing` / `explore` / `status`) versus only capturing it —
+  surfacing the retrieval half of the capture/recall asymmetry. Read-only; counts
+  `post-tool-use` observations over a trailing window plus a lifetime baseline,
+  with a per-tool breakdown and recall-calls-per-prompt.
+
 ## [1.2.2] - 2026-06-23
 
 ### Fixed

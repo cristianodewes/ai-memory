@@ -56,6 +56,7 @@ async fn main() -> Result<()> {
     match command {
         Command::Init(args) => commands::init::run(&config, args, config_path.as_deref()),
         Command::Status(args) => commands::status::run(&config, args).await,
+        Command::RecallStats(args) => commands::recall_stats::run(&config, args).await,
         Command::AuditContamination(args) => {
             commands::audit_contamination::run(&config, args).await
         }

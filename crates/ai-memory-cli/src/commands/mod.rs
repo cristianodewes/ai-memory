@@ -34,6 +34,7 @@ pub mod path_util;
 pub mod pending_writes;
 pub mod purge_project;
 pub mod read_page;
+pub mod recall_stats;
 pub mod reindex;
 pub mod rename_project;
 pub mod render_shared;

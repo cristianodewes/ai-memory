@@ -40,7 +40,8 @@ pub use reader::{
     ContaminationFinding, ContaminationReport, ContaminationSummary, DecayCandidate,
     DerivedIndexStatus, EmbeddingTripleCount, HealthDetail, HealthPage, ObservationHit, PageAuthor,
     PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool,
-    ReindexTargetStatus, RelatedPage, ScopeRow, StatusCounts, StoredEmbedding, StoredPageBody,
+    RecallStats, RecallToolCount, ReindexTargetStatus, RelatedPage, ScopeRow, StatusCounts,
+    StoredEmbedding, StoredPageBody,
     WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use scope::{

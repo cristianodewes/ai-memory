@@ -8,6 +8,7 @@
 //! - `POST /admin/auto-improve/report` — read-only auto-improve telemetry report.
 //! - `POST /admin/curator`        — dry-run or stage a rule-based curator report.
 //! - `GET  /admin/status`         — lifetime counts + server data-dir info.
+//! - `GET  /admin/recall-stats`   — how often agents READ memory back (recall vs capture).
 //! - `GET  /admin/search?q=`      — FTS5 hits against the wiki index.
 //! - `POST /admin/reorg`          — retro-fit sessions to per-cwd projects.
 //! - `POST /admin/lint`           — run the M8 lint pass.
@@ -454,6 +455,7 @@ fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
 /// - `POST /admin/auto-improve/report`
 /// - `POST /admin/curator`
 /// - `GET  /admin/status`
+/// - `GET  /admin/recall-stats`
 /// - `GET  /admin/audit-contamination`
 /// - `GET  /admin/search`
 /// - `GET  /admin/read-page`
@@ -499,6 +501,7 @@ pub fn admin_router(state: AdminState) -> Router {
             post(handle_pending_write_reject),
         )
         .route("/admin/status", get(handle_status))
+        .route("/admin/recall-stats", get(handle_recall_stats))
         .route(
             "/admin/audit-contamination",
             get(handle_audit_contamination),
@@ -738,6 +741,66 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
                     counts,
                     derived,
                     providers: state.provider_health.snapshot(),
+                };
+                (
+                    StatusCode::OK,
+                    Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+                )
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            ),
+        },
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------
+// recall-stats
+// ---------------------------------------------------------------------
+
+/// JSON response body for `GET /admin/recall-stats?days=N`. Surfaces the
+/// retrieval half of the capture/recall asymmetry: lifecycle hooks capture
+/// every prompt + tool call automatically, but consulting memory is a
+/// voluntary agent action — this measures how often it actually happens.
+#[derive(Debug, Serialize)]
+pub struct RecallStatsReport {
+    /// The trailing window (in days) the `window` slice covers (default 30).
+    pub window_days: u32,
+    /// Recall stats over the requested trailing window.
+    pub window: ai_memory_store::RecallStats,
+    /// Recall stats over all recorded history (the lifetime baseline).
+    pub lifetime: ai_memory_store::RecallStats,
+}
+
+/// Query string for `GET /admin/recall-stats?days=…`.
+#[derive(Debug, Deserialize)]
+struct RecallStatsQuery {
+    /// Trailing window in days for the `window` slice. Clamped to `[1, 3650]`.
+    #[serde(default = "default_recall_days")]
+    days: u32,
+}
+
+fn default_recall_days() -> u32 {
+    30
+}
+
+async fn handle_recall_stats(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<RecallStatsQuery>,
+) -> impl IntoResponse {
+    let days = query.days.clamp(1, 3650);
+    match state.reader.recall_stats(days).await {
+        Ok(window) => match state.reader.recall_stats(0).await {
+            Ok(lifetime) => {
+                let report = RecallStatsReport {
+                    window_days: days,
+                    window,
+                    lifetime,
                 };
                 (
                     StatusCode::OK,
@@ -6175,6 +6238,7 @@ mod tests {
                 serde_json::json!({"workspace": "default", "project": "scratch"}),
             ),
             ("GET", "/admin/status", serde_json::Value::Null),
+            ("GET", "/admin/recall-stats", serde_json::Value::Null),
             ("GET", "/admin/audit-contamination", serde_json::Value::Null),
             ("GET", "/admin/search?q=test", serde_json::Value::Null),
             (

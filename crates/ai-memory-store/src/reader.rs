@@ -348,6 +348,49 @@ pub struct BriefingPage {
     pub updated_at: String,
 }
 
+/// Recall instrumentation slice for one time window, surfaced by
+/// [`ReaderPool::recall_stats`]. Answers "are agents actually reading
+/// memory back, or only writing to it?" — the retrieval half of the
+/// capture/recall asymmetry. Lifecycle hooks capture every prompt + tool
+/// call automatically (the write side), but consulting memory is a
+/// voluntary agent action (the read side); this measures the read side.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RecallStats {
+    /// Window size in days this slice covers; `0` means lifetime.
+    pub days: u32,
+    /// Sessions started in the window.
+    pub sessions: u64,
+    /// `user-prompt` observations in the window — the recall-opportunity
+    /// denominator (each prompt is a chance for the agent to consult memory).
+    pub user_prompts: u64,
+    /// `post-tool-use` observations in the window (every completed tool call).
+    pub tool_calls: u64,
+    /// `post-tool-use` calls whose tool is an ai-memory READ/recall tool
+    /// (`memory_query` / `read_page` / `recent` / `briefing` / `explore` /
+    /// `status`).
+    pub recall_calls: u64,
+    /// `post-tool-use` calls to a NON-recall ai-memory tool (`consolidate`,
+    /// `write_page`, `delete_page`, `handoff_*`, `auto_improve`, `lint`,
+    /// `forget_sweep`, `install_self_routing`) — reported for contrast.
+    pub memory_other_calls: u64,
+    /// Per-tool recall breakdown (recall tools only, zero-count tools omitted).
+    pub by_tool: Vec<RecallToolCount>,
+    /// Mean recall calls per user prompt (`recall_calls / user_prompts`). Can
+    /// exceed `1.0` when an agent makes several recall calls for one prompt;
+    /// `None` when there were no prompts in the window (ratio undefined).
+    pub recall_per_prompt: Option<f64>,
+}
+
+/// One recall tool's short name and how many times it was called in the
+/// window. Component of [`RecallStats::by_tool`].
+#[derive(Debug, Clone, Serialize)]
+pub struct RecallToolCount {
+    /// Canonical recall tool name (e.g. `memory_query`).
+    pub tool: String,
+    /// Completed (`post-tool-use`) calls to that tool in the window.
+    pub count: u64,
+}
+
 /// One row per (workspace, project) with aggregate stats.
 /// Returned by [`ReaderPool::list_projects_with_stats`].
 #[derive(Debug, Clone, Serialize)]
@@ -3785,6 +3828,102 @@ impl ReaderPool {
         .await
     }
 
+    /// Recall instrumentation — the retrieval half of the capture/recall
+    /// asymmetry. Classifies `post-tool-use` observations into ai-memory
+    /// READ/recall tools vs write/maintenance tools, measured against the
+    /// recall-opportunity denominators (sessions started + user prompts).
+    ///
+    /// `days == 0` means lifetime (no lower time bound); otherwise the slice
+    /// covers the trailing `days` days. Pure SQL aggregation, read-only, no
+    /// LLM. Global across every workspace/project — the baseline question is
+    /// "are agents reading memory back at all?".
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    #[allow(clippy::cast_precision_loss)]
+    pub async fn recall_stats(&self, days: u32) -> StoreResult<RecallStats> {
+        self.with_conn(move |conn| {
+            let cutoff_us: i64 = if days == 0 {
+                0
+            } else {
+                let day_us: i64 = 86_400 * 1_000_000;
+                jiff::Timestamp::now().as_microsecond() - i64::from(days) * day_us
+            };
+
+            let sessions = count_since(
+                conn,
+                "SELECT COUNT(*) FROM sessions WHERE started_at > ?1",
+                cutoff_us,
+            )?;
+            let user_prompts = count_since(
+                conn,
+                "SELECT COUNT(*) FROM observations WHERE kind = 'user-prompt' AND created_at > ?1",
+                cutoff_us,
+            )?;
+            let tool_calls = count_since(
+                conn,
+                "SELECT COUNT(*) FROM observations WHERE kind = 'post-tool-use' AND created_at > ?1",
+                cutoff_us,
+            )?;
+
+            // Pull memory-tool calls grouped by raw title (e.g.
+            // `mcp__ai-memory__memory_query`). The Rust classifier below is the
+            // authoritative filter, so the LIKE is just a cheap prefilter.
+            // Count only `post-tool-use` (each call also emits a `pre-tool-use`;
+            // counting both would double every number).
+            let mut stmt = conn.prepare_cached(
+                "SELECT title, COUNT(*) \
+                 FROM observations \
+                 WHERE kind = 'post-tool-use' AND created_at > ?1 \
+                   AND title LIKE '%memory\\_%' ESCAPE '\\' \
+                 GROUP BY title",
+            )?;
+            let rows = stmt.query_map(params![cutoff_us], |row| {
+                let title: String = row.get(0)?;
+                let n: i64 = row.get(1)?;
+                Ok((title, u64::try_from(n.max(0)).unwrap_or(0)))
+            })?;
+
+            let mut recall_calls: u64 = 0;
+            let mut memory_other_calls: u64 = 0;
+            let mut recall_by_tool = vec![0u64; RECALL_TOOLS.len()];
+            for row in rows {
+                let (title, n) = row?;
+                if let Some(i) = RECALL_TOOLS.iter().position(|t| title.contains(t)) {
+                    recall_calls += n;
+                    recall_by_tool[i] += n;
+                } else if NON_RECALL_TOOLS.iter().any(|t| title.contains(t)) {
+                    memory_other_calls += n;
+                }
+            }
+
+            let by_tool = RECALL_TOOLS
+                .iter()
+                .zip(recall_by_tool)
+                .filter(|(_, count)| *count > 0)
+                .map(|(tool, count)| RecallToolCount {
+                    tool: (*tool).to_string(),
+                    count,
+                })
+                .collect();
+
+            let recall_per_prompt =
+                (user_prompts > 0).then(|| recall_calls as f64 / user_prompts as f64);
+
+            Ok(RecallStats {
+                days,
+                sessions,
+                user_prompts,
+                tool_calls,
+                recall_calls,
+                memory_other_calls,
+                by_tool,
+                recall_per_prompt,
+            })
+        })
+        .await
+    }
+
     /// Return health counters for derived indexes and link/embedding state.
     ///
     /// These checks are intentionally read-only and derived-index-safe: they
@@ -4548,6 +4687,48 @@ fn count(conn: &Connection, sql: &str) -> StoreResult<u64> {
     Ok(u64::try_from(n.unwrap_or(0)).unwrap_or(0))
 }
 
+/// ai-memory READ/recall tool names — a call to one of these means the agent
+/// is consulting memory (the retrieval half of [`ReaderPool::recall_stats`]).
+/// Matched as a substring of the observation `title`, which is the raw tool
+/// name and is usually MCP-prefixed (`mcp__ai-memory__memory_query`). None of
+/// these names is a substring of another, so first-match classification is
+/// unambiguous. Order is the `recall-stats` display order.
+const RECALL_TOOLS: [&str; 6] = [
+    "memory_query",
+    "memory_read_page",
+    "memory_recent",
+    "memory_briefing",
+    "memory_explore",
+    "memory_status",
+];
+
+/// ai-memory NON-recall tool names — they mutate, summarise, hand off, or
+/// (re)configure memory rather than reading it back to inform the current
+/// task, so they are reported separately from recall in
+/// [`ReaderPool::recall_stats`]. (Some, e.g. `install_self_routing`, are
+/// read-only but still not task-recall — hence "other", not "write".)
+const NON_RECALL_TOOLS: [&str; 10] = [
+    "memory_consolidate",
+    "memory_write_page",
+    "memory_delete_page",
+    "memory_handoff_begin",
+    "memory_handoff_accept",
+    "memory_handoff_cancel",
+    "memory_auto_improve",
+    "memory_lint",
+    "memory_forget_sweep",
+    "memory_install_self_routing",
+];
+
+/// Scalar `COUNT(*)` with a single time-bound parameter (`created_at` or
+/// `started_at > ?1`). Sibling of [`count`] for the windowed recall queries.
+fn count_since(conn: &Connection, sql: &str, cutoff_us: i64) -> StoreResult<u64> {
+    let n: Option<i64> = conn
+        .query_row(sql, params![cutoff_us], |row| row.get(0))
+        .optional()?;
+    Ok(u64::try_from(n.unwrap_or(0)).unwrap_or(0))
+}
+
 fn count_project(
     conn: &Connection,
     sql: &str,
@@ -5016,6 +5197,109 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(handoff.summary, "right project");
+    }
+
+    /// `recall_stats` must split `post-tool-use` rows into recall vs write
+    /// buckets by tool name, ignore non-memory tools, exclude `pre-tool-use`
+    /// (so calls aren't double-counted), and compute recall-per-prompt. This
+    /// is the classification the baseline report depends on.
+    #[tokio::test]
+    async fn recall_stats_classifies_recall_vs_write_vs_other() {
+        use ai_memory_core::{NewObservation, NewSession, ObservationKind};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("default").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        let sid = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+
+        let obs = |kind: ObservationKind, title: &str| NewObservation {
+            session_id: sid,
+            workspace_id: ws,
+            project_id: proj,
+            kind,
+            extension: None,
+            source_event: None,
+            title: title.to_string(),
+            body: String::new(),
+            importance: 5,
+        };
+        // 2 prompts (the recall-opportunity denominator).
+        for title in ["voltei", "fix it"] {
+            store
+                .writer
+                .insert_observation(obs(ObservationKind::UserPrompt, title))
+                .await
+                .unwrap();
+        }
+        // Recall tools (MCP-prefixed titles): 2x query + 1x recent.
+        for title in [
+            "mcp__ai-memory__memory_query",
+            "mcp__ai-memory__memory_query",
+            "mcp__ai-memory__memory_recent",
+        ] {
+            store
+                .writer
+                .insert_observation(obs(ObservationKind::PostToolUse, title))
+                .await
+                .unwrap();
+        }
+        // Write tool: consolidate is a memory write, not recall.
+        store
+            .writer
+            .insert_observation(obs(ObservationKind::PostToolUse, "mcp__ai-memory__memory_consolidate"))
+            .await
+            .unwrap();
+        // Non-memory tool: ignored by both buckets.
+        store
+            .writer
+            .insert_observation(obs(ObservationKind::PostToolUse, "Bash"))
+            .await
+            .unwrap();
+        // pre-tool-use must NOT be counted (only the completed post-tool-use is).
+        store
+            .writer
+            .insert_observation(obs(ObservationKind::PreToolUse, "mcp__ai-memory__memory_query"))
+            .await
+            .unwrap();
+
+        let stats = store.reader.recall_stats(0).await.unwrap();
+
+        assert_eq!(stats.sessions, 1);
+        assert_eq!(stats.user_prompts, 2);
+        assert_eq!(stats.tool_calls, 5, "5 post-tool-use rows; pre-tool-use excluded");
+        assert_eq!(stats.recall_calls, 3, "2x memory_query + 1x memory_recent");
+        assert_eq!(stats.memory_other_calls, 1, "consolidate is a non-recall memory call");
+        // recall density can exceed 1.0 here (3 recall calls / 2 prompts).
+        assert!((stats.recall_per_prompt.unwrap() - 1.5).abs() < 1e-9);
+        let by_tool: Vec<(&str, u64)> =
+            stats.by_tool.iter().map(|t| (t.tool.as_str(), t.count)).collect();
+        assert_eq!(by_tool, vec![("memory_query", 2), ("memory_recent", 1)]);
+
+        // The windowed path (days > 0) must exercise the cutoff branch; since
+        // every row was just written, it returns the same counts as lifetime.
+        let windowed = store.reader.recall_stats(30).await.unwrap();
+        assert_eq!(windowed.days, 30);
+        assert_eq!(windowed.user_prompts, 2);
+        assert_eq!(windowed.tool_calls, 5);
+        assert_eq!(windowed.recall_calls, 3);
+        assert_eq!(windowed.memory_other_calls, 1);
     }
 
     /// A stored `repo_path` equal to the operator's `$HOME` must never be

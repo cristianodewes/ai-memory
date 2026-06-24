@@ -31,6 +31,10 @@ pub enum Command {
     Init(InitArgs),
     /// Print runtime status (counts, paths, version).
     Status(StatusArgs),
+    /// Measure how often agents READ memory back vs only capturing it
+    /// (recall instrumentation: memory_query/read_page/recent/briefing/
+    /// explore/status calls per prompt, over a window + lifetime).
+    RecallStats(RecallStatsArgs),
     /// Audit the store for likely cross-project contamination (read-only,
     /// SQL-only). Flags sessions whose cwd resolves to a different project and
     /// observations whose project disagrees with their session.
@@ -568,6 +572,18 @@ pub struct InitArgs {
 /// Arguments for `status`.
 #[derive(Debug, Args)]
 pub struct StatusArgs {
+    /// Emit the report as JSON instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `recall-stats`.
+#[derive(Debug, Args)]
+pub struct RecallStatsArgs {
+    /// Trailing window in days for the windowed slice (default 30). The
+    /// lifetime baseline is always reported alongside it.
+    #[arg(long)]
+    pub days: Option<u32>,
     /// Emit the report as JSON instead of human-readable text.
     #[arg(long)]
     pub json: bool,

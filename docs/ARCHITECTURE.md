@@ -259,7 +259,7 @@ cwd parameters use their canonical names.
 ## CLI subcommand surface
 
 ```
-init                 status               search
+init                 status               search               recall-stats
 read-page            write-page           delete-page
 serve                reset                backup
 restore              reindex              install-hooks
