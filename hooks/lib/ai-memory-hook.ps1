@@ -20,6 +20,28 @@ function Get-AiMemoryCwd {
     return $null
 }
 
+# Extract the user prompt text from a UserPromptSubmit payload. Tries "prompt",
+# then "message", then "text" — the same field precedence the server uses to
+# derive the user-prompt observation. JSON parse first (handles escaping), regex
+# fallback otherwise. Mirrors the POSIX `ai_memory_extract_prompt`.
+function Get-AiMemoryPrompt {
+    param([string] $Payload)
+    if (-not $Payload) { return $null }
+    try {
+        $Parsed = $Payload | ConvertFrom-Json -ErrorAction Stop
+        foreach ($Name in @("prompt", "message", "text")) {
+            $Value = $Parsed.$Name
+            if ($Value -is [string] -and $Value.Length -gt 0) { return $Value }
+        }
+    } catch {
+    }
+    foreach ($Name in @("prompt", "message", "text")) {
+        $m = [regex]::Match($Payload, "`"$Name`"\s*:\s*`"([^`"]*)`"")
+        if ($m.Success -and $m.Groups[1].Value.Length -gt 0) { return $m.Groups[1].Value }
+    }
+    return $null
+}
+
 function Get-AiMemoryMarkerToml {
     param([string] $Cwd)
     if (-not $Cwd) { return $null }
@@ -108,6 +130,7 @@ function Invoke-AiMemoryHook {
         [Parameter(Mandatory = $true)] [string] $Event,
         [Parameter(Mandatory = $true)] [string] $Agent,
         [switch] $FetchHandoff,
+        [switch] $FetchRecall,
         [switch] $AntigravityPreInvocationOutput
     )
 
@@ -155,6 +178,25 @@ function Invoke-AiMemoryHook {
         } catch {
             if ($AntigravityPreInvocationOutput) {
                 [Console]::Out.Write("{}")
+            }
+        }
+    } elseif ($FetchRecall -and $env:AI_MEMORY_INJECT_RECALL) {
+        # Opt-in prompt-time recall injection: fetch memory relevant to the
+        # prompt and write it as context (raw stdout, like the handoff). 1s
+        # cap; empty/error writes nothing so the turn is never delayed.
+        $Prompt = Get-AiMemoryPrompt -Payload $Payload
+        if ($Prompt) {
+            $Trim = $Prompt.Substring(0, [Math]::Min(200, $Prompt.Length))
+            try {
+                $RecallResp = Invoke-WebRequest `
+                    -UseBasicParsing `
+                    -TimeoutSec 1 `
+                    -Uri "$Server/recall?q=$([uri]::EscapeDataString($Trim))$QS" `
+                    -Headers $Headers
+                if ($null -ne $RecallResp -and $RecallResp.Content) {
+                    [Console]::Out.Write($RecallResp.Content)
+                }
+            } catch {
             }
         }
     } elseif ($AntigravityPreInvocationOutput) {

@@ -18,9 +18,29 @@ QS=$(ai_memory_marker_qs "$CWD")
 
 printf '%s' "$PAYLOAD" \
     | ai_memory_post_hook "$SERVER/hook?event=user-prompt&agent=claude-code${QS}" >/dev/null 2>&1 || true
-# Acknowledge to Claude Code with an empty JSON object. This hook only
-# POSTs (fire-and-forget) and injects no context; without "{" on stdout
-# Claude Code treats the (empty) output as plain text and logs
+
+# Opt-in prompt-time recall injection (default OFF). When
+# AI_MEMORY_INJECT_RECALL is set, synchronously fetch memory possibly
+# relevant to this prompt and prepend it to the agent's context via
+# hookSpecificOutput.additionalContext — the same injection seam
+# session-start uses for the handoff. This converts recall from a
+# voluntary tool call into automatic context. The GET has a 0.5s cap and
+# returns an empty body on miss/timeout, so a turn is never delayed.
+if [ -n "${AI_MEMORY_INJECT_RECALL:-}" ]; then
+    PROMPT=$(ai_memory_extract_prompt "$PAYLOAD")
+    if [ -n "$PROMPT" ]; then
+        Q=$(ai_memory_url_encode "$(printf '%s' "$PROMPT" | cut -c1-200)")
+        RECALL=$(ai_memory_get_recall "$SERVER/recall?q=${Q}${QS}" 2>/dev/null || true)
+        if [ -n "$RECALL" ]; then
+            printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":%s}}\n' \
+                "$(printf '%s' "$RECALL" | ai_memory_json_string)"
+            exit 0
+        fi
+    fi
+fi
+
+# Default path: acknowledge with an empty JSON object. Without "{" on
+# stdout Claude Code treats the (empty) output as plain text and logs
 # "Hook output does not start with {, treating as plain text" on every
 # prompt. Emitting {} keeps the debug log clean.
 printf '{}\n'

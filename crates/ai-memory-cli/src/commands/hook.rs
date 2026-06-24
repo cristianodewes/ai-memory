@@ -19,7 +19,9 @@ use ai_memory_llm::OidcToken;
 
 use crate::cli::HookArgs;
 
-use super::hook_capture::{build_client, extract_cwd, get_handoff, marker_query_suffix};
+use super::hook_capture::{
+    build_client, extract_cwd, extract_prompt, get_handoff, marker_query_suffix, url_encode,
+};
 use super::hook_spool;
 use super::path_util::strip_windows_verbatim_prefix;
 
@@ -30,6 +32,10 @@ use super::path_util::strip_windows_verbatim_prefix;
 // boundary never hangs unbounded).
 const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_HANDOFF_TIMEOUT: Duration = Duration::from_secs(3);
+// Recall fires on EVERY prompt (the agent's hot path), unlike the once-per-
+// session handoff, so its GET is capped much tighter. Parity with the shell
+// hook's 0.5s `ai_memory_get_recall`; an empty result just skips injection.
+const DEFAULT_RECALL_TIMEOUT: Duration = Duration::from_millis(500);
 const DEFAULT_START_BUDGET: Duration = Duration::from_secs(3);
 const DEFAULT_END_BUDGET: Duration = Duration::from_secs(10);
 const MAX_OVERRIDE_MINUTES: u64 = 60;
@@ -214,6 +220,34 @@ pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()
                 println!("{envelope}");
                 return Ok(());
             }
+        }
+    }
+
+    // user-prompt: opt-in prompt-time recall injection. Like the session-start
+    // handoff, synchronously fetch memory relevant to the prompt and inject it
+    // as context. Gated by AI_MEMORY_INJECT_RECALL (default off); read-only on
+    // the server; only for agents that consume hook stdout (grok ignores it).
+    // `get_handoff` is a generic GET helper, reused here for the recall route.
+    if args.event == "user-prompt"
+        && std::env::var_os("AI_MEMORY_INJECT_RECALL").is_some()
+        && AgentKind::from_wire(&args.agent).session_start_injects_handoff()
+        && let Some(prompt) = extract_prompt(&json)
+    {
+        let trimmed: String = prompt.chars().take(200).collect();
+        let client = build_client();
+        let bearer = hook_spool::resolve_bearer(&client, &dd, args.auth_token.as_deref()).await;
+        let recall_url = format!("{base}/recall?q={}{qs}", url_encode(&trimmed));
+        if let Some(recall) =
+            get_handoff(&client, &recall_url, bearer.as_deref(), DEFAULT_RECALL_TIMEOUT).await
+        {
+            let envelope = serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": recall,
+                }
+            });
+            println!("{envelope}");
+            return Ok(());
         }
     }
 

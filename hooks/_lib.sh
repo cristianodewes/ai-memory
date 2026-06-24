@@ -57,6 +57,26 @@ ai_memory_extract_cwd() {
         | head -n 1
 }
 
+# Extract the user prompt text from a UserPromptSubmit JSON payload on stdin or
+# in $1. Tries "prompt", then "message", then "text" — the same field precedence
+# the server uses to derive the user-prompt observation — and returns the first
+# non-empty value (up to the first unescaped quote). Like `ai_memory_extract_cwd`
+# this is a tiny shell fallback, not a JSON parser: a prefix is plenty for an FTS
+# recall query and the server normalises whatever it receives, so early
+# truncation at an escaped quote is harmless. The closing quote in the match key
+# keeps `"message"` from matching `"messageId"`.
+ai_memory_extract_prompt() {
+    payload="${1:-$(cat)}"
+    for _amk in prompt message text; do
+        rest=${payload#*\"$_amk\"}
+        [ "$rest" = "$payload" ] && continue
+        val=$(printf '%s' "$rest" \
+            | sed -n -E 's/^[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' \
+            | head -n 1)
+        [ -n "$val" ] && { printf '%s' "$val"; return 0; }
+    done
+}
+
 # URL-encode the minimal set of characters that have meaning in a query
 # string. Sufficient for the schema's value regex (`^[a-z0-9][a-z0-9._-]*$`)
 # plus a defensive pass for anything a hand-edited marker might contain.
@@ -153,6 +173,21 @@ ai_memory_get_handoff() {
             -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN"
     else
         curl -s --max-time 1.0 "$1"
+    fi
+}
+
+# GET "$1" with the same auth-header rules as `ai_memory_post_hook`. Used by
+# `user-prompt-submit.sh` to fetch prompt-time recall for injection. 0.5s
+# budget — TIGHTER than the handoff GET because this fires on EVERY prompt
+# (the agent's hot path), not once per session; the server returns an empty
+# body if it can't answer in time, so injection silently no-ops rather than
+# delaying the turn.
+ai_memory_get_recall() {
+    if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
+        curl -s --max-time 0.5 "$1" \
+            -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN"
+    else
+        curl -s --max-time 0.5 "$1"
     fi
 }
 

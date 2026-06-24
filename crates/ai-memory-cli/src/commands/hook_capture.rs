@@ -19,6 +19,22 @@ pub fn extract_cwd(payload: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// First non-empty top-level prompt string in the payload, used to build the
+/// prompt-time recall query. Tries `prompt`, then `message`, then `text` — the
+/// same field precedence the server uses to derive the user-prompt observation
+/// (`ai-memory-hooks` payload `extract_string`), so the hook queries with the
+/// same text the server records. Parity with `ai_memory_extract_prompt`.
+pub fn extract_prompt(payload: &serde_json::Value) -> Option<String> {
+    for key in ["prompt", "message", "text"] {
+        if let Some(s) = payload.get(key).and_then(|v| v.as_str())
+            && !s.is_empty()
+        {
+            return Some(s.to_owned());
+        }
+    }
+    None
+}
+
 /// URL-encode the reserved characters `ai_memory_url_encode` handles.
 pub fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -301,6 +317,26 @@ mod tests {
     fn missing_cwd_is_none() {
         let p: serde_json::Value = serde_json::from_str(r#"{"x":1}"#).unwrap();
         assert_eq!(extract_cwd(&p), None);
+    }
+
+    #[test]
+    fn extract_prompt_prefers_prompt_then_message_then_text() {
+        let j = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        // Precedence matches the server's extract_string field order.
+        assert_eq!(
+            extract_prompt(&j(r#"{"prompt":"p","message":"m","text":"t"}"#)).as_deref(),
+            Some("p")
+        );
+        assert_eq!(
+            extract_prompt(&j(r#"{"message":"m","text":"t"}"#)).as_deref(),
+            Some("m")
+        );
+        assert_eq!(extract_prompt(&j(r#"{"text":"t"}"#)).as_deref(), Some("t"));
+        // Empty value falls through; with nothing else present → None.
+        assert_eq!(extract_prompt(&j(r#"{"prompt":""}"#)), None);
+        // Exact-key lookup: "messageId" must not be read as "message".
+        assert_eq!(extract_prompt(&j(r#"{"messageId":"x"}"#)), None);
+        assert_eq!(extract_prompt(&j(r#"{}"#)), None);
     }
 
     #[test]

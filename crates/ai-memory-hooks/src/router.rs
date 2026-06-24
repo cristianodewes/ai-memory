@@ -190,13 +190,15 @@ pub struct HookState {
     pub home_dir: Option<String>,
 }
 
-/// Build a router with `POST /hook` (event ingress) and `GET /handoff`
-/// (synchronous handoff-fetch for session-start hooks).
+/// Build a router with `POST /hook` (event ingress), `GET /handoff`
+/// (synchronous handoff-fetch for session-start hooks), and `GET /recall`
+/// (synchronous prompt-time recall for user-prompt-submit hooks).
 pub fn hook_router(state: HookState) -> Router {
     Router::new()
         .route("/hook", post(handle_hook))
         .route("/hook/batch", post(handle_hook_batch))
         .route("/handoff", get(handle_handoff))
+        .route("/recall", get(handle_recall))
         .with_state(Arc::new(state))
 }
 
@@ -460,6 +462,116 @@ fn render_handoff_markdown(h: &Handoff) -> String {
          answer from THIS content; do NOT re-call the tool. Call \
          `memory_query` / `memory_recent` only for additional \
          context beyond what's listed here._\n",
+    );
+    buf
+}
+
+/// Query params for `GET /recall` — synchronous prompt-time recall used by
+/// `user-prompt-submit` hooks to inject possibly-relevant prior memory before
+/// the agent reasons about the prompt. Mirrors `HandoffQuery`'s project-
+/// resolution fields so a marker-declared `(workspace, project)` is honoured.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RecallQuery {
+    /// The user's prompt text to search memory for.
+    pub q: Option<String>,
+    /// Optional cwd for project resolution (mirror of `HookQuery.cwd`).
+    pub cwd: Option<String>,
+    /// Workspace override (mirror of `HookQuery.workspace`).
+    pub workspace: Option<String>,
+    /// Project override (mirror of `HookQuery.project`).
+    pub project: Option<String>,
+    /// Project strategy (mirror of `HookQuery.project_strategy`).
+    pub project_strategy: Option<String>,
+    /// Max hits to inject. Defaults to 3, capped at 10.
+    pub limit: Option<usize>,
+}
+
+/// Synchronous endpoint the `user-prompt-submit` hook calls to fetch memory
+/// possibly relevant to the prompt, for injection as `additionalContext`.
+///
+/// Deliberately CHEAP and READ-ONLY to respect the fire-and-forget hot path
+/// (invariant #5): FTS5 + graph only (no embedding call — `HookState` has no
+/// embedder anyway), no access-count bump, no mutation. It always returns
+/// `200`; on any error or empty result it returns an empty body so the hook
+/// injects nothing and never blocks the agent. The hook script owns the hard
+/// timeout.
+async fn handle_recall(
+    State(state): State<Arc<HookState>>,
+    Query(query): Query<RecallQuery>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+) -> impl IntoResponse {
+    let actor_user = actor_ext
+        .map(|axum::Extension(ctx)| ctx.user)
+        .unwrap_or_default();
+    match fetch_recall(&state, query, actor_user).await {
+        Ok(Some(markdown)) => (StatusCode::OK, markdown),
+        Ok(None) => (StatusCode::OK, String::new()),
+        Err(e) => {
+            warn!(error = %e, "recall fetch failed");
+            (StatusCode::OK, String::new())
+        }
+    }
+}
+
+async fn fetch_recall(
+    state: &HookState,
+    query: RecallQuery,
+    actor_user: Option<String>,
+) -> anyhow::Result<Option<String>> {
+    let Some(prompt) = query.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let limit = query.limit.unwrap_or(3).clamp(1, 10);
+    let actor_key = ai_memory_core::ActorKey {
+        user: actor_user,
+        session_id: None,
+    };
+    let (ws, proj) = resolve_project_ids(
+        state,
+        query.cwd.as_deref(),
+        query.workspace.as_deref(),
+        query.project.as_deref(),
+        ProjectStrategy::parse(query.project_strategy.as_deref()),
+        &actor_key,
+    )
+    .await?;
+    let hits = state
+        .reader
+        .search_pages_for_project(ws, proj, prompt.to_string(), limit)
+        .await?;
+    if hits.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(render_recall_markdown(&hits)))
+}
+
+/// Render FTS hits as a compact, injection-friendly Markdown block. Snippets
+/// are stripped of FTS `<mark>` tags and collapsed to single-spaced text. The
+/// framing is deliberately tentative ("possibly relevant") so the agent treats
+/// it as a lead, not ground truth.
+fn render_recall_markdown(hits: &[ai_memory_store::PageHit]) -> String {
+    let mut buf = String::with_capacity(256);
+    buf.push_str(
+        "> 🧠 **ai-memory: possibly-relevant prior context** (auto-retrieved for this prompt)\n",
+    );
+    for h in hits {
+        let snippet = h
+            .snippet
+            .replace("<mark>", "")
+            .replace("</mark>", "")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        buf.push_str(&format!(
+            "> - **{}** (`{}`): {}\n",
+            h.title.trim(),
+            h.path.as_str(),
+            snippet.trim()
+        ));
+    }
+    buf.push_str(
+        "> \n> _Leads only — open any in full with `memory_read_page`, or search more with \
+         `memory_query`. Ignore if irrelevant._\n",
     );
     buf
 }
@@ -1148,6 +1260,82 @@ mod tests {
                 .unwrap();
         }
         repo
+    }
+
+    /// `/recall` end-to-end: a page in the resolved project is found by FTS,
+    /// rendered as injection-ready Markdown with `<mark>` stripped; an empty
+    /// prompt and a non-matching prompt both yield no injection.
+    #[tokio::test]
+    async fn recall_returns_matching_pages_as_markdown() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+
+        state
+            .writer
+            .upsert_page(ai_memory_core::NewPage {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                path: ai_memory_core::PagePath::new("decisions/widget-pricing.md").unwrap(),
+                title: "Widget pricing decision".to_string(),
+                body: "We set the widget price at 42 dollars after the margin review.".to_string(),
+                tier: ai_memory_core::Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: vec![],
+                author_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Matching prompt → Markdown hit (title + path), marks stripped.
+        let hit = fetch_recall(
+            &state,
+            RecallQuery {
+                q: Some("widget".to_string()),
+                workspace: Some("default".to_string()),
+                project: Some("scratch".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("matching prompt should return a recall block");
+        assert!(hit.contains("Widget pricing decision"), "{hit}");
+        assert!(hit.contains("decisions/widget-pricing.md"), "{hit}");
+        assert!(!hit.contains("<mark>"), "FTS marks must be stripped: {hit}");
+
+        // Blank prompt → no injection.
+        assert!(
+            fetch_recall(
+                &state,
+                RecallQuery {
+                    q: Some("   ".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        // Non-matching prompt → no injection.
+        assert!(
+            fetch_recall(
+                &state,
+                RecallQuery {
+                    q: Some("zzzqqq-nonexistent".to_string()),
+                    workspace: Some("default".to_string()),
+                    project: Some("scratch".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
     }
 
     /// Two hook events with distinct cwds must land in two distinct projects.

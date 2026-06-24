@@ -1,3 +1,3 @@
 . "$PSScriptRoot\..\lib\ai-memory-hook.ps1"
-Invoke-AiMemoryHook -Event "user-prompt" -Agent "gemini-cli"
+Invoke-AiMemoryHook -Event "user-prompt" -Agent "gemini-cli" -FetchRecall
 exit 0

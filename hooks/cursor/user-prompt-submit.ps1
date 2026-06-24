@@ -1,3 +1,3 @@
 . "$PSScriptRoot\..\lib\ai-memory-hook.ps1"
-Invoke-AiMemoryHook -Event "user-prompt" -Agent "cursor"
+Invoke-AiMemoryHook -Event "user-prompt" -Agent "cursor" -FetchRecall
 exit 0

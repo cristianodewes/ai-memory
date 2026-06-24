@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surfacing the retrieval half of the capture/recall asymmetry. Read-only; counts
   `post-tool-use` observations over a trailing window plus a lifetime baseline,
   with a per-tool breakdown and recall-calls-per-prompt.
+- Opt-in prompt-time recall injection (`AI_MEMORY_INJECT_RECALL`, default off):
+  the `user-prompt-submit` hook synchronously fetches memory relevant to the
+  prompt from a new read-only `GET /recall?q=…` endpoint (FTS5 + graph, no
+  embedding call) and injects the top hits as context — the same seam
+  `session-start` uses for the handoff. Wired for Claude Code (JSON
+  `additionalContext`), Codex/Cursor/Gemini CLI/OpenCode (raw stdout), and the
+  native `ai-memory hook` command; Grok is skipped (it ignores hook stdout).
+  Tightly time-boxed (≤1s) and empty on miss so a turn is never delayed.
 
 ## [1.2.2] - 2026-06-23
 
