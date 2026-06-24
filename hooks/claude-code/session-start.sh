@@ -30,7 +30,7 @@ printf '%s' "$PAYLOAD" \
 # does not start with "{", so Claude Code logs every session start as
 # "Hook output does not start with {, treating as plain text". JSON
 # injects the same handoff with a clean debug log; no handoff -> "{}".
-HANDOFF=$(ai_memory_get_handoff "$SERVER/handoff?agent=claude-code${QS}" 2>/dev/null || true)
+HANDOFF=$(ai_memory_get_handoff "$SERVER/handoff?agent=claude-code${QS}$(ai_memory_scent_qs)" 2>/dev/null || true)
 if [ -n "$HANDOFF" ]; then
     printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":%s}}\n' \
         "$(printf '%s' "$HANDOFF" | ai_memory_json_string)"

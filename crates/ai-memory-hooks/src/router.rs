@@ -191,14 +191,16 @@ pub struct HookState {
 }
 
 /// Build a router with `POST /hook` (event ingress), `GET /handoff`
-/// (synchronous handoff-fetch for session-start hooks), and `GET /recall`
-/// (synchronous prompt-time recall for user-prompt-submit hooks).
+/// (synchronous handoff-fetch for session-start hooks), `GET /recall`
+/// (synchronous prompt-time recall for user-prompt-submit hooks), and
+/// `GET /scent` (synchronous project "memory map" for session-start hooks).
 pub fn hook_router(state: HookState) -> Router {
     Router::new()
         .route("/hook", post(handle_hook))
         .route("/hook/batch", post(handle_hook_batch))
         .route("/handoff", get(handle_handoff))
         .route("/recall", get(handle_recall))
+        .route("/scent", get(handle_scent))
         .with_state(Arc::new(state))
 }
 
@@ -342,6 +344,12 @@ pub struct HandoffQuery {
     pub project: Option<String>,
     /// Project strategy (mirror of `HookQuery.project_strategy`).
     pub project_strategy: Option<String>,
+    /// When present (`scent=1`), append the project "memory map" (the
+    /// SessionStart scent) below the handoff in one response — the open handoff
+    /// it just fetched seeds the relevance layer, with no extra round-trip.
+    /// Opt-in: the session-start hook sets it only when `AI_MEMORY_INJECT_SCENT`
+    /// is enabled.
+    pub scent: Option<String>,
 }
 
 /// Synchronous endpoint used by `session-start.sh` to discover any
@@ -377,6 +385,7 @@ async fn fetch_and_accept_handoff(
     actor_user: Option<String>,
 ) -> anyhow::Result<Option<String>> {
     let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
+    let want_scent = query.scent.is_some();
     // `/handoff` has no session_id in the request — `per_session` mode
     // therefore falls back to the single slot (graceful degradation),
     // while `per_actor` keys by `user` alone.
@@ -397,11 +406,34 @@ async fn fetch_and_accept_handoff(
         .reader
         .latest_open_handoff(ws, proj, query.cwd)
         .await?;
-    let Some(h) = handoff else {
-        return Ok(None);
+
+    // Accept + render the handoff if one is open.
+    let handoff_md = match &handoff {
+        Some(h) => {
+            state.writer.accept_handoff(h.id, agent, None).await?;
+            Some(render_handoff_markdown(h))
+        }
+        None => None,
     };
-    state.writer.accept_handoff(h.id, agent, None).await?;
-    Ok(Some(render_handoff_markdown(&h)))
+
+    // Optionally append the project memory map (scent=1) below the handoff. The
+    // just-fetched open handoff seeds its relevance layer, so there is no extra
+    // round-trip and no ordering race with the accept above.
+    let scent_md = if want_scent {
+        build_scent_markdown(state, ws, proj, handoff.as_ref())
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+
+    Ok(match (handoff_md, scent_md) {
+        (Some(h), Some(s)) => Some(format!("{h}\n{s}")),
+        (Some(h), None) => Some(h),
+        (None, Some(s)) => Some(s),
+        (None, None) => None,
+    })
 }
 
 fn render_handoff_markdown(h: &Handoff) -> String {
@@ -573,6 +605,193 @@ fn render_recall_markdown(hits: &[ai_memory_store::PageHit]) -> String {
         "> \n> _Leads only — open any in full with `memory_read_page`, or search more with \
          `memory_query`. Ignore if irrelevant._\n",
     );
+    buf
+}
+
+/// Query params for `GET /scent` — the synchronous project "memory map"
+/// injected at session start (below the handoff) so the agent knows WHAT
+/// durable memory the project holds. Mirrors `HandoffQuery`'s project-
+/// resolution fields.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ScentQuery {
+    /// Optional cwd for project resolution (mirror of `HookQuery.cwd`).
+    pub cwd: Option<String>,
+    /// Workspace override (mirror of `HookQuery.workspace`).
+    pub workspace: Option<String>,
+    /// Project override (mirror of `HookQuery.project`).
+    pub project: Option<String>,
+    /// Project strategy (mirror of `HookQuery.project_strategy`).
+    pub project_strategy: Option<String>,
+}
+
+/// Synchronous endpoint the `session-start` hook calls (alongside `/handoff`)
+/// to fetch a compact, deterministic "memory map" of the project for injection
+/// as context: counts/activity, `_slots/` + `_rules/`, a by-kind breakdown,
+/// recent entry points, and — when an open handoff exists — pages relevant to
+/// its next steps (reusing the recall search). No LLM. Read-only. Returns an
+/// empty body for an empty project (nothing worth injecting) so a fresh repo
+/// gets no noise. Always `200`; the hook owns the timeout.
+async fn handle_scent(
+    State(state): State<Arc<HookState>>,
+    Query(query): Query<ScentQuery>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+) -> impl IntoResponse {
+    let actor_user = actor_ext
+        .map(|axum::Extension(ctx)| ctx.user)
+        .unwrap_or_default();
+    match fetch_scent(&state, query, actor_user).await {
+        Ok(Some(markdown)) => (StatusCode::OK, markdown),
+        Ok(None) => (StatusCode::OK, String::new()),
+        Err(e) => {
+            warn!(error = %e, "scent fetch failed");
+            (StatusCode::OK, String::new())
+        }
+    }
+}
+
+async fn fetch_scent(
+    state: &HookState,
+    query: ScentQuery,
+    actor_user: Option<String>,
+) -> anyhow::Result<Option<String>> {
+    let actor_key = ai_memory_core::ActorKey {
+        user: actor_user,
+        session_id: None,
+    };
+    let (ws, proj) = resolve_project_ids(
+        state,
+        query.cwd.as_deref(),
+        query.workspace.as_deref(),
+        query.project.as_deref(),
+        ProjectStrategy::parse(query.project_strategy.as_deref()),
+        &actor_key,
+    )
+    .await?;
+    // Standalone path: peek the latest OPEN handoff read-only for layer D (the
+    // accept happens only in /handoff). The /handoff?scent=1 path passes the
+    // handoff it already holds, so it needs no peek and has no ordering race.
+    let handoff = state
+        .reader
+        .latest_open_handoff(ws, proj, query.cwd.clone())
+        .await
+        .ok()
+        .flatten();
+    build_scent_markdown(state, ws, proj, handoff.as_ref()).await
+}
+
+/// Build the project "memory map" Markdown (or `None` for an empty project).
+/// Shared by the standalone `GET /scent` and the `GET /handoff?scent=1` path.
+/// When `handoff` is present, its next steps + open questions seed the recall
+/// search that surfaces pages relevant to where the previous session left off.
+async fn build_scent_markdown(
+    state: &HookState,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    handoff: Option<&Handoff>,
+) -> anyhow::Result<Option<String>> {
+    // Fetch a few extra recents so the render still has 5 distilled pages to
+    // show after filtering out session logs.
+    let brief = state.reader.briefing_for_project(ws, proj, 15).await?;
+    // Empty project → no map worth injecting (keeps a fresh repo noise-free,
+    // and reflects that the scent is only as rich as the consolidated wiki).
+    if brief.counts.pages_latest == 0 {
+        return Ok(None);
+    }
+    let kinds = state.reader.page_kind_counts_for_project(ws, proj).await?;
+
+    let relevant = match handoff {
+        Some(h) => {
+            let q: String = h
+                .next_steps
+                .iter()
+                .chain(h.open_questions.iter())
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" ");
+            if q.trim().is_empty() {
+                Vec::new()
+            } else {
+                state
+                    .reader
+                    .search_pages_for_project(ws, proj, q, 3)
+                    .await
+                    .unwrap_or_default()
+            }
+        }
+        None => Vec::new(),
+    };
+
+    Ok(Some(render_scent_markdown(&brief, &kinds, &relevant)))
+}
+
+/// Render the project memory map as a compact, skimmable Markdown block.
+/// Budgeted on purpose: this lands in EVERY session's context, so it favours a
+/// high-signal index (slots, rules, by-kind shape, a few entry points) over a
+/// wall of text — deep content stays one `memory_read_page` away.
+fn render_scent_markdown(
+    brief: &ai_memory_store::BriefingSnapshot,
+    kinds: &[(String, u64)],
+    relevant: &[ai_memory_store::PageHit],
+) -> String {
+    let mut buf = String::with_capacity(512);
+    buf.push_str("> 📚 **ai-memory — project memory map**\n");
+    let last = brief.last_observation_at.as_deref().unwrap_or("never");
+    buf.push_str(&format!(
+        "> {} page(s) · last activity {} · {} obs/30d · {} pending handoff(s)\n",
+        brief.counts.pages_latest,
+        last,
+        brief.activity_30d.observations,
+        brief.pending_handoff_count
+    ));
+
+    if !brief.slots.is_empty() {
+        buf.push_str("> \n> 📌 **Slots** (active context):\n");
+        for p in &brief.slots {
+            buf.push_str(&format!("> - {} (`{}`)\n", p.title.trim(), p.path));
+        }
+    }
+    if !brief.rules.is_empty() {
+        buf.push_str("> \n> 📏 **Rules** (treat as constraints):\n");
+        for p in &brief.rules {
+            buf.push_str(&format!("> - {} (`{}`)\n", p.title.trim(), p.path));
+        }
+    }
+
+    // The "Knows" line is the DISTILLED-knowledge map. Exclude `session`
+    // (episodic logs — surfaced via `recent`/the handoff, and they'd otherwise
+    // dominate the counts) and `slot`/`rule` (each shown verbatim in its own
+    // section above, so counting them here would double-report).
+    let distilled: Vec<String> = kinds
+        .iter()
+        .filter(|(k, _)| !matches!(k.as_str(), "session" | "slot" | "rule"))
+        .map(|(k, n)| format!("{n} {k}"))
+        .collect();
+    if !distilled.is_empty() {
+        buf.push_str(&format!("> \n> 🗺️ **Knows:** {}\n", distilled.join(" · ")));
+    }
+    // Recent distilled entry points. Skip `session` pages: their UUID paths are
+    // noise and "where we left off" is already covered by the handoff above.
+    // Match the path prefix too — the briefing's coarser kind derivation tags
+    // `sessions/` pages as `fact`, so a kind check alone would miss them.
+    let recents: Vec<String> = brief
+        .recent_pages
+        .iter()
+        .filter(|p| p.kind != "session" && !p.path.starts_with("sessions/"))
+        .take(5)
+        .map(|p| format!("`{}`", p.path))
+        .collect();
+    if !recents.is_empty() {
+        buf.push_str(&format!("> recent: {}\n", recents.join(", ")));
+    }
+
+    if !relevant.is_empty() {
+        buf.push_str("> \n> 🎯 **Relevant to your handoff:**\n");
+        for h in relevant {
+            buf.push_str(&format!("> - {} (`{}`)\n", h.title.trim(), h.path.as_str()));
+        }
+    }
+
+    buf.push_str("> \n> _Open any with `memory_read_page` · search with `memory_query`._\n");
     buf
 }
 
@@ -1335,6 +1554,101 @@ mod tests {
             .await
             .unwrap()
             .is_none()
+        );
+    }
+
+    /// `/scent` end-to-end: renders the by-kind map + `_rules/` + recent entry
+    /// points, surfaces handoff-relevant pages (via the recall search on the
+    /// open handoff's next steps), and yields nothing for an empty project.
+    #[tokio::test]
+    async fn scent_renders_project_map_and_handoff_relevant_pages() {
+        use ai_memory_core::{NewHandoff, NewPage, PagePath, Tier};
+
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let (ws, proj) = (state.workspace_id, state.project_id);
+
+        let page = |path: &str, title: &str, body: &str| NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new(path).unwrap(),
+            title: title.to_string(),
+            body: body.to_string(),
+            tier: Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: vec![],
+            author_id: None,
+        };
+        for p in [
+            page(
+                "decisions/recall-injection.md",
+                "Recall injection design",
+                "inject memory on every prompt",
+            ),
+            page(
+                "gotchas/windows-crlf.md",
+                "Windows CRLF in hooks",
+                "shell hooks use crlf line endings",
+            ),
+            page(
+                "_rules/commit-style.md",
+                "Always end commits with Co-Authored-By",
+                "every commit message ends with the trailer",
+            ),
+            // An episodic session page must NOT pollute the distilled map.
+            page(
+                "sessions/01abc.md",
+                "an old session log",
+                "raw session transcript",
+            ),
+        ] {
+            state.writer.upsert_page(p).await.unwrap();
+        }
+
+        // Open handoff whose next step mentions the gotcha → layer D surfaces it.
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "wip".into(),
+                open_questions: vec![],
+                next_steps: vec!["fix the windows crlf gotcha in hooks".into()],
+                files_touched: vec![],
+            })
+            .await
+            .unwrap();
+
+        let md = fetch_scent(&state, ScentQuery::default(), None)
+            .await
+            .unwrap()
+            .expect("populated project should yield a scent");
+
+        assert!(md.contains("project memory map"), "{md}");
+        assert!(md.contains("🗺️ **Knows:**"), "{md}");
+        assert!(md.contains("decision"), "{md}");
+        // Rules section surfaces the rule title.
+        assert!(md.contains("📏"), "{md}");
+        assert!(md.contains("Co-Authored-By"), "{md}");
+        // Handoff-relevant section surfaces the matching gotcha.
+        assert!(md.contains("🎯"), "{md}");
+        assert!(md.contains("Windows CRLF in hooks"), "{md}");
+        // Episodic session pages are excluded from the map (Knows + recent).
+        assert!(!md.contains("session"), "session pages must not pollute the map: {md}");
+
+        // Empty project → no scent (no noise for a fresh repo).
+        let tmp2 = TempDir::new().unwrap();
+        let empty = make_state(&tmp2).await;
+        assert!(
+            fetch_scent(&empty, ScentQuery::default(), None)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -2773,6 +3087,7 @@ mod tests {
                 workspace: Some("acme".into()),
                 project: None,
                 project_strategy: None,
+                scent: None,
             },
             None,
         )
@@ -2782,6 +3097,104 @@ mod tests {
         assert!(
             rendered.as_deref().is_some_and(|s| s.contains("continue")),
             "workspace-only marker handoff lookup must resolve workspace + basename(cwd)"
+        );
+    }
+
+    /// `/handoff?scent=1` returns the handoff WITH the project memory map
+    /// appended in one response; without the flag it returns the handoff alone.
+    #[tokio::test]
+    async fn handoff_with_scent_appends_project_map() {
+        use ai_memory_core::{NewHandoff, NewPage, PagePath, Tier};
+
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let (ws, proj) = (state.workspace_id, state.project_id);
+
+        state
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("decisions/scope.md").unwrap(),
+                title: "Scope decision".into(),
+                body: "we decided the scope of the scent work".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: vec![],
+                author_id: None,
+            })
+            .await
+            .unwrap();
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "wip summary".into(),
+                open_questions: vec![],
+                next_steps: vec!["finish the scope work".into()],
+                files_touched: vec![],
+            })
+            .await
+            .unwrap();
+
+        // scent=1 → handoff + map in one response (handoff consumed here).
+        let with_scent = fetch_and_accept_handoff(
+            &state,
+            HandoffQuery {
+                agent: Some("claude-code".into()),
+                scent: Some("1".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("handoff + scent");
+        assert!(with_scent.contains("wip summary"), "handoff present: {with_scent}");
+        assert!(
+            with_scent.contains("project memory map"),
+            "scent appended: {with_scent}"
+        );
+        assert!(with_scent.contains("Scope decision"), "{with_scent}");
+
+        // No flag → handoff only, no map (fresh handoff since the first was consumed).
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "second handoff".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+            })
+            .await
+            .unwrap();
+        let no_scent = fetch_and_accept_handoff(
+            &state,
+            HandoffQuery {
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("handoff only");
+        assert!(no_scent.contains("second handoff"), "{no_scent}");
+        assert!(
+            !no_scent.contains("project memory map"),
+            "no scent without scent=1: {no_scent}"
         );
     }
 
@@ -2826,6 +3239,7 @@ mod tests {
                 workspace: None,
                 project: None,
                 project_strategy: None,
+                scent: None,
             },
             None,
         )

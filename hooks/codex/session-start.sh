@@ -17,5 +17,5 @@ QS=$(ai_memory_marker_qs "$CWD")
 
 printf '%s' "$PAYLOAD" \
     | ai_memory_post_hook "$SERVER/hook?event=session-start&agent=codex${QS}" >/dev/null 2>&1 || true
-ai_memory_get_handoff "$SERVER/handoff?agent=codex${QS}" 2>/dev/null || true
+ai_memory_get_handoff "$SERVER/handoff?agent=codex${QS}$(ai_memory_scent_qs)" 2>/dev/null || true
 exit 0

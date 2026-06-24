@@ -157,11 +157,14 @@ function Invoke-AiMemoryHook {
     }
 
     if ($FetchHandoff) {
+        # Opt-in: append the project memory map (scent) to the SAME /handoff
+        # response when AI_MEMORY_INJECT_SCENT is set. Disabled => handoff alone.
+        $Scent = if ($env:AI_MEMORY_INJECT_SCENT) { "&scent=1" } else { "" }
         try {
             $Response = Invoke-WebRequest `
                 -UseBasicParsing `
                 -TimeoutSec 2 `
-                -Uri "$Server/handoff?agent=$Agent$QS" `
+                -Uri "$Server/handoff?agent=$Agent$QS$Scent" `
                 -Headers $Headers
             if ($null -ne $Response -and $Response.Content) {
                 if ($AntigravityPreInvocationOutput) {

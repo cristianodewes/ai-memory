@@ -17,5 +17,5 @@ QS=$(ai_memory_marker_qs "$CWD")
 
 printf '%s' "$PAYLOAD" \
     | ai_memory_post_hook "$SERVER/hook?event=session-start&agent=gemini-cli${QS}" >/dev/null 2>&1 || true
-ai_memory_get_handoff "$SERVER/handoff?agent=gemini-cli${QS}" 2>/dev/null || true
+ai_memory_get_handoff "$SERVER/handoff?agent=gemini-cli${QS}$(ai_memory_scent_qs)" 2>/dev/null || true
 exit 0

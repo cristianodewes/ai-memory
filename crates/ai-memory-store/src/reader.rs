@@ -3924,6 +3924,55 @@ impl ReaderPool {
         .await
     }
 
+    /// Per-kind `is_latest = 1` page counts for a project — the "map by type"
+    /// the SessionStart scent renders so an agent sees the SHAPE of what the
+    /// project knows (e.g. `5 decision`, `3 gotcha`). Kind comes from the
+    /// frontmatter `kind`, falling back to the path prefix — the same
+    /// derivation the briefing uses. Ordered most-common first.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn page_kind_counts_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Vec<(String, u64)>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT COALESCE( \
+                        json_extract(frontmatter_json, '$.kind'), \
+                        CASE \
+                            WHEN path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
+                            WHEN path LIKE '\\_slots/%' ESCAPE '\\' THEN 'slot' \
+                            WHEN path LIKE 'decisions/%' THEN 'decision' \
+                            WHEN path LIKE 'gotchas/%' THEN 'gotcha' \
+                            WHEN path LIKE 'concepts/%' THEN 'concept' \
+                            WHEN path LIKE 'procedures/%' THEN 'procedure' \
+                            WHEN path LIKE 'notes/%' THEN 'note' \
+                            WHEN path LIKE 'sessions/%' THEN 'session' \
+                            ELSE 'fact' \
+                        END \
+                    ) AS kind, COUNT(*) \
+                 FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
+                 GROUP BY kind \
+                 ORDER BY COUNT(*) DESC, kind ASC",
+            )?;
+            let counts = stmt
+                .query_map(
+                    params![workspace_id.as_bytes(), project_id.as_bytes()],
+                    |row| {
+                        let kind: String = row.get(0)?;
+                        let n: i64 = row.get(1)?;
+                        Ok((kind, u64::try_from(n.max(0)).unwrap_or(0)))
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(counts)
+        })
+        .await
+    }
+
     /// Return health counters for derived indexes and link/embedding state.
     ///
     /// These checks are intentionally read-only and derived-index-safe: they

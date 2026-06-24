@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `additionalContext`), Codex/Cursor/Gemini CLI/OpenCode (raw stdout), and the
   native `ai-memory hook` command; Grok is skipped (it ignores hook stdout).
   Tightly time-boxed (≤1s) and empty on miss so a turn is never delayed.
+- Opt-in SessionStart "memory map" (scent) (`AI_MEMORY_INJECT_SCENT`, default
+  off): a new read-only `GET /scent` and a `GET /handoff?scent=1` variant return
+  a compact, deterministic map of the project's durable memory — by-kind counts,
+  `_rules/` + `_slots/`, recent entry points, and pages relevant to the open
+  handoff's next steps (reusing the recall search). The session-start hook adds
+  `&scent=1` so the map rides the existing handoff fetch (no extra round-trip);
+  empty projects inject nothing. Same agent matrix as recall injection.
 
 ## [1.2.2] - 2026-06-23
 

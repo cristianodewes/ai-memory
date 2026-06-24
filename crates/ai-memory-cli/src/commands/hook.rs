@@ -207,7 +207,14 @@ pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()
         if AgentKind::from_wire(&args.agent).session_start_injects_handoff() {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, args.auth_token.as_deref()).await;
-            let handoff_url = format!("{base}/handoff?agent={}{qs}", args.agent);
+            // Opt-in: fold the project memory map (scent) into the same
+            // /handoff response when AI_MEMORY_INJECT_SCENT is set.
+            let scent = if std::env::var_os("AI_MEMORY_INJECT_SCENT").is_some() {
+                "&scent=1"
+            } else {
+                ""
+            };
+            let handoff_url = format!("{base}/handoff?agent={}{qs}{scent}", args.agent);
             if let Some(handoff) =
                 get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await
             {

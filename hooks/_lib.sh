@@ -143,6 +143,15 @@ ai_memory_marker_qs() {
     printf '%s' "$qs"
 }
 
+# Emit "&scent=1" when AI_MEMORY_INJECT_SCENT is set (opt-in), else nothing.
+# Appended to the session-start /handoff URL so the server folds the project
+# "memory map" (the scent) into the SAME response — see GET /handoff?scent=1.
+# `return 0` so the empty (disabled) case never reports a non-zero status.
+ai_memory_scent_qs() {
+    [ -n "${AI_MEMORY_INJECT_SCENT:-}" ] && printf '&scent=1'
+    return 0
+}
+
 # POST stdin to "$1" as JSON, fire-and-forget. Adds an
 # `Authorization: Bearer` header when `AI_MEMORY_AUTH_TOKEN` is set.
 # The 0.5s timeout matches the project-wide hook latency budget
